@@ -4,11 +4,11 @@
 
 mod mpv;
 
-use mpv::Player;
+use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
-use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::Duration};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract, Provider};
-use yt_lite_native_player_proof::{command_for, select_muxed_stream, PlaybackAction};
+use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
@@ -96,11 +96,18 @@ fn time_label(seconds: f64) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
-type StreamResolution = Result<(String, String), String>;
+#[derive(Debug)]
+struct ResolvedStream {
+    url: String,
+    title: String,
+    provider: Provider,
+}
 
-/// Resolve network media off the UI thread, returning a single signed,
-/// muxed (audio+video) stream. No URL is logged or shown in errors.
-fn spawn_extraction(video_url: String, helper: PathBuf) -> Receiver<StreamResolution> {
+type StreamResolution = Result<ResolvedStream, String>;
+
+/// Fetch metadata on a worker and return one muxed HTTP stream for direct,
+/// incremental libmpv playback. No media file is downloaded or logged.
+fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> Receiver<StreamResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> StreamResolution {
@@ -109,18 +116,16 @@ fn spawn_extraction(video_url: String, helper: PathBuf) -> Receiver<StreamResolu
                 .build()
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
             runtime.block_on(async {
-                let primary = extract(&video_url, Provider::Rust, &helper).await;
-                if let Ok(ref info) = primary {
-                    if let Some(stream) = select_muxed_stream(info) {
-                        return Ok((stream.url.clone(), info.title.clone()));
-                    }
-                }
-                let fallback = extract(&video_url, Provider::YtDlp, &helper).await
+                let info = extract(&video_url, provider, &helper).await
                     .map_err(|error| format!("{} {}", error.message, error.action))?;
-                let stream = select_muxed_stream(&fallback).ok_or_else(|| {
-                    "No combined video+audio stream available; separate-track playback is not implemented in this proof".to_string()
+                let stream = select_muxed_stream(&info).ok_or_else(|| {
+                    "No combined audio+video HTTP stream available from this provider".to_string()
                 })?;
-                Ok((stream.url.clone(), fallback.title.clone()))
+                Ok(ResolvedStream {
+                    url: stream.url.clone(),
+                    title: info.title,
+                    provider,
+                })
             })
         })();
         let _ = sender.send(result);
@@ -128,16 +133,30 @@ fn spawn_extraction(video_url: String, helper: PathBuf) -> Receiver<StreamResolu
     receiver
 }
 
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Rust => "Rust",
+        Provider::YtDlp => "yt-dlp",
+        Provider::Auto => "auto",
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let input = args.next().ok_or(
-        "Usage: yt-lite-native-player-proof <local-video-file | YouTube-video-URL> [--yt-dlp PATH]"
+        "Usage: yt-lite-native-player-proof <local-video-file | YouTube-video-URL> [--provider auto|rust|yt-dlp] [--yt-dlp PATH]"
     )?;
     let mut helper = PathBuf::from("yt-dlp");
+    let mut requested_provider = Provider::Auto;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--yt-dlp" => {
                 helper = PathBuf::from(args.next().ok_or("Missing --yt-dlp PATH")?);
+            }
+            "--provider" => {
+                let selection = args.next().ok_or("Missing --provider VALUE")?;
+                requested_provider = Provider::parse(&selection)
+                    .ok_or("Provider must be auto, rust or yt-dlp")?;
             }
             _ => return Err(format!("Unknown option: {flag}").into()),
         }
@@ -151,7 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
-    let remote_receiver = remote_url.map(|url| spawn_extraction(url, helper));
+    let initial_provider = if requested_provider == Provider::Auto { Provider::Rust } else { requested_provider };
+    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
@@ -222,10 +242,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut receiver = remote_receiver;
     let mut pending: Option<StreamResolution> = None;
     let mut resolving = receiver.is_some();
+    let mut media_title: Option<String> = None;
+    let mut active_provider = initial_provider;
     let mut playback_error: Option<String> = None;
-    let mut active_title: Option<String> = None;
+    let mut load_started: Option<Instant> = None;
+    let mut file_loaded = false;
+    let mut has_network_media = false;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        let mut failure: Option<String> = None;
+
+        // Unlike the earlier prototype, consume the mpv event queue. An
+        // accepted asynchronous loadfile command does NOT mean media loaded.
+        for event in label_player.borrow().poll_events() {
+            match event {
+                PlaybackEvent::StartFile => {
+                    // This may also fire when retrying; do not interpret as playback.
+                }
+                PlaybackEvent::FileLoaded => {
+                    if load_started.is_some() {
+                        load_started = None;
+                        file_loaded = true;
+                        eprintln!("[yt-lite] {} media loaded; streaming", provider_label(active_provider));
+                    }
+                }
+                PlaybackEvent::LoadFailed(code) => {
+                    if load_started.is_some() || (has_network_media && file_loaded) {
+                        failure.get_or_insert_with(|| format!("mpv media load failed (code {code})"));
+                    } else if remote_url.is_none() {
+                        playback_error = Some(format!("Local media failed to load (mpv code {code})"));
+                    }
+                }
+                PlaybackEvent::Ended => {}
+            }
+        }
+
+        if let Some(start) = load_started {
+            if start.elapsed() > Duration::from_secs(30) {
+                failure.get_or_insert_with(|| "mpv did not load the network stream in 30 seconds".into());
+            }
+        }
+
         if let Some(rx) = receiver.as_ref() {
             match rx.try_recv() {
                 Ok(response) => {
@@ -234,40 +291,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(TryRecvError::Disconnected) => {
                     receiver = None;
-                    resolving = false;
-                    playback_error = Some("Extractor worker exited without a result".into());
+                    failure.get_or_insert_with(|| "Extractor worker exited without a result".into());
                 }
                 Err(TryRecvError::Empty) => {}
             }
         }
 
         if let Some(response) = pending.take() {
-            let renderer_ready = { label_player.borrow().is_render_ready() };
-            if !renderer_ready {
-                // The Slint rendering notifier must establish mpv's GL context
-                // before we hand its playback core a signed media URL.
+            let ready = { label_player.borrow().is_render_ready() };
+            if !ready {
+                // Wait for Slint to establish the libmpv GL context.
                 pending = Some(response);
             } else {
                 resolving = false;
                 match response {
-                    Ok((stream_url, title)) => {
-                        match label_player.borrow_mut().load_network_stream(&stream_url) {
-                            Ok(()) => active_title = Some(title),
-                            Err(error) => playback_error = Some(error),
+                    Ok(stream) => {
+                        active_provider = stream.provider;
+                        media_title = Some(stream.title);
+                        eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
+                        match label_player.borrow_mut().load_network_stream(&stream.url) {
+                            Ok(()) => {
+                                load_started = Some(Instant::now());
+                                file_loaded = false;
+                                has_network_media = true;
+                            }
+                            Err(err) => failure = Some(err),
                         }
                     }
-                    Err(error) => playback_error = Some(error),
+                    Err(err) => failure = Some(err),
                 }
             }
         }
 
+        if let Some(err) = failure {
+            // Runtime failures (HTTP 403, expired signatures, etc.) are distinct
+            // from extraction success. Try the other extractor exactly once.
+            if let Some(next) = fallback_after_playback_error(active_provider, requested_provider) {
+                if let Some(ref url) = remote_url {
+                    eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
+                    let _ = label_player.borrow().send_strings(&["stop".into()]);
+                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next));
+                    active_provider = next;
+                    pending = None;
+                    resolving = true;
+                    media_title = None;
+                    load_started = None;
+                    file_loaded = false;
+                    has_network_media = false;
+                } else {
+                    playback_error = Some(err);
+                }
+            } else {
+                eprintln!("[yt-lite] playback failure: {err}");
+                playback_error = Some(err);
+                resolving = false;
+                load_started = None;
+            }
+        }
+
         if let Some(ui) = label_window.upgrade() {
-            if let Some(ref error) = playback_error {
-                ui.set_status(format!("Playback setup failed: {error}").into());
+            if let Some(ref err) = playback_error {
+                ui.set_status(format!("Playback failed: {err}").into());
                 return;
             }
             if resolving {
-                ui.set_status("Resolving YouTube media...".into());
+                ui.set_status(format!("Resolving {} media...", provider_label(active_provider)).into());
+                return;
+            }
+            if load_started.is_some() {
+                ui.set_status(format!("Connecting to {} stream (not downloading video)...", provider_label(active_provider)).into());
                 return;
             }
             let player = label_player.borrow();
@@ -275,8 +367,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let duration = player.property_double(c"duration").unwrap_or(0.0);
             let fraction = if duration > 0.0 { (elapsed / duration).clamp(0.0, 1.0) } else { 0.0 };
             ui.set_fraction(fraction as f32);
-            let title = active_title.as_deref().unwrap_or("Local video");
-            ui.set_status(format!("{title}  |  {} / {}", time_label(elapsed), time_label(duration)).into());
+            let title = media_title.as_deref().unwrap_or("Local video");
+            let buffering = file_loaded && player.property_flag(c"paused-for-cache").unwrap_or(false);
+            let prefix = if buffering { "Buffering | " } else { "" };
+            ui.set_status(format!("{prefix}{title}  |  {} / {}", time_label(elapsed), time_label(duration)).into());
             ui.set_paused(player.property_flag(c"pause").unwrap_or(false));
         }
     });
