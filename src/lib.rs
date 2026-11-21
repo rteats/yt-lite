@@ -111,7 +111,6 @@ impl<T> From<&Capability<T>> for CapabilityCount {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ExtractionSummary {
     pub provider: Provider,
-    pub video_id: String,
     pub duration_seconds: Option<u64>,
     pub streams: CapabilityCount,
     pub video_streams: usize,
@@ -137,7 +136,6 @@ pub fn summarize_extraction(result: &ExtractionResult) -> ExtractionSummary {
     };
     ExtractionSummary {
         provider: result.provider,
-        video_id: result.video_id.clone(),
         duration_seconds: result.duration_seconds,
         streams: (&result.streams).into(),
         video_streams,
