@@ -5,7 +5,7 @@ yt-lite is a local-first desktop client for browsing and playing YouTube content
 ## People and content
 
 **Local profile**:
-An identity inside yt-lite with its own subscriptions, history, playlists, playback progress, and feed preferences. It is not a Google account.
+An identity inside yt-lite with its own subscriptions, history, playlists, playback progress, feed preferences, and visible offline-library items. It is not a Google account.
 _Avoid_: Google account, login
 
 **Subscription**:
@@ -35,10 +35,18 @@ A tracked request to save a video or audio item for offline use.
 _Avoid_: Playback queue
 
 **Offline library item**:
-A deliberately downloaded, retained media item available for playback without fetching it again. Underlying media files may be shared across local profiles without duplicate storage.
+A profile-owned reference to deliberately downloaded media available for offline playback, including retained metadata. Multiple profiles may refer to the same stored media.
+_Avoid_: Cache entry
+
+**Stored media**:
+The downloaded media data retained on disk and potentially referenced by more than one offline library item.
+_Avoid_: Offline library item
 
 **Cache entry**:
 Disposable, size-bounded stored content such as a thumbnail or video metadata, distinct from an offline library item.
+
+**Transcript**:
+Time-aligned text associated with a video that can be searched and used to seek within playback.
 
 ## Data access
 
