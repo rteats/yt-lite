@@ -1,13 +1,14 @@
 #![cfg(target_os = "windows")]
 //! Standalone issue #2 prototype: one Slint window, one libmpv core, one GL render context.
-//! Load a local test clip only. No YouTube extraction or distribution packaging here.
+//! Experimental local-file and YouTube URL playback, not a release-ready watch page.
 
 mod mpv;
 
 use mpv::Player;
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
-use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
-use yt_lite_native_player_proof::{command_for, PlaybackAction};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::Duration};
+use yt_lite_extraction_proof::{canonical_video_url, extract, Provider};
+use yt_lite_native_player_proof::{command_for, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
@@ -22,7 +23,7 @@ slint::slint! {
 
         in-out property <bool> paused: false;
         in-out property <float> fraction: 0;
-        in-out property <string> status: "Opening local clip...";
+        in-out property <string> status: "Opening source...";
         callback toggle-pause();
         callback seek-by(int);
         callback seek-to(float);
@@ -95,11 +96,62 @@ fn time_label(seconds: f64) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
+type StreamResolution = Result<(String, String), String>;
+
+/// Resolve network media off the UI thread, returning a single signed,
+/// muxed (audio+video) stream. No URL is logged or shown in errors.
+fn spawn_extraction(video_url: String, helper: PathBuf) -> Receiver<StreamResolution> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> StreamResolution {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
+            runtime.block_on(async {
+                let primary = extract(&video_url, Provider::Rust, &helper).await;
+                if let Ok(ref info) = primary {
+                    if let Some(stream) = select_muxed_stream(info) {
+                        return Ok((stream.url.clone(), info.title.clone()));
+                    }
+                }
+                let fallback = extract(&video_url, Provider::YtDlp, &helper).await
+                    .map_err(|error| format!("{} {}", error.message, error.action))?;
+                let stream = select_muxed_stream(&fallback).ok_or_else(|| {
+                    "No combined video+audio stream available; separate-track playback is not implemented in this proof".to_string()
+                })?;
+                Ok((stream.url.clone(), fallback.title.clone()))
+            })
+        })();
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let clip = std::env::args_os().nth(1).map(PathBuf::from)
-        .ok_or("Usage: yt-lite-native-player-proof <existing-local-video-file>")?;
-    let clip = clip.canonicalize()?;
-    if !clip.is_file() { return Err("Local video path must point to a file".into()); }
+    let mut args = std::env::args().skip(1);
+    let input = args.next().ok_or(
+        "Usage: yt-lite-native-player-proof <local-video-file | YouTube-video-URL> [--yt-dlp PATH]"
+    )?;
+    let mut helper = PathBuf::from("yt-dlp");
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--yt-dlp" => {
+                helper = PathBuf::from(args.next().ok_or("Missing --yt-dlp PATH")?);
+            }
+            _ => return Err(format!("Unknown option: {flag}").into()),
+        }
+    }
+    let (clip, remote_url) = if input.starts_with("https://") || input.starts_with("http://") {
+        let (_, canonical) = canonical_video_url(&input)
+            .map_err(|error| format!("{} {}", error.message, error.action))?;
+        (None, Some(canonical))
+    } else {
+        let path = PathBuf::from(input).canonicalize()?;
+        if !path.is_file() { return Err("Local video path must point to a file".into()); }
+        (Some(path), None)
+    };
+    let remote_receiver = remote_url.map(|url| spawn_extraction(url, helper));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
@@ -150,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !matches!(api, GraphicsAPI::NativeOpenGL { .. }) { return; }
         match phase {
             RenderingState::RenderingSetup => {
-                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), &clip) {
+                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), clip.as_deref()) {
                     eprintln!("Video initialization error: {error}");
                 }
             }
@@ -167,15 +219,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let label_window = window.as_weak();
     let label_player = player.clone();
+    let mut receiver = remote_receiver;
+    let mut pending: Option<StreamResolution> = None;
+    let mut resolving = receiver.is_some();
+    let mut playback_error: Option<String> = None;
+    let mut active_title: Option<String> = None;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        if let Some(rx) = receiver.as_ref() {
+            match rx.try_recv() {
+                Ok(response) => {
+                    pending = Some(response);
+                    receiver = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    receiver = None;
+                    resolving = false;
+                    playback_error = Some("Extractor worker exited without a result".into());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        if let Some(response) = pending.take() {
+            if !label_player.borrow().is_render_ready() {
+                // The Slint rendering notifier must establish mpv's GL context
+                // before we hand its playback core a signed media URL.
+                pending = Some(response);
+            } else {
+                resolving = false;
+                match response {
+                    Ok((stream_url, title)) => {
+                        match label_player.borrow_mut().load_network_stream(&stream_url) {
+                            Ok(()) => active_title = Some(title),
+                            Err(error) => playback_error = Some(error),
+                        }
+                    }
+                    Err(error) => playback_error = Some(error),
+                }
+            }
+        }
+
         if let Some(ui) = label_window.upgrade() {
+            if let Some(ref error) = playback_error {
+                ui.set_status(format!("Playback setup failed: {error}").into());
+                return;
+            }
+            if resolving {
+                ui.set_status("Resolving YouTube media...".into());
+                return;
+            }
             let player = label_player.borrow();
             let elapsed = player.property_double(c"time-pos").unwrap_or(0.0);
             let duration = player.property_double(c"duration").unwrap_or(0.0);
             let fraction = if duration > 0.0 { (elapsed / duration).clamp(0.0, 1.0) } else { 0.0 };
             ui.set_fraction(fraction as f32);
-            ui.set_status(format!("{} / {}", time_label(elapsed), time_label(duration)).into());
+            let title = active_title.as_deref().unwrap_or("Local video");
+            ui.set_status(format!("{title}  |  {} / {}", time_label(elapsed), time_label(duration)).into());
             ui.set_paused(player.property_flag(c"pause").unwrap_or(false));
         }
     });
