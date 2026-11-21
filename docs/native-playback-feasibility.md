@@ -1,6 +1,6 @@
 # Native Slint/libmpv rendering proof — issue #2
 
-This is a **Windows x64 feasibility experiment**, not a release, not yet a verified playback result.
+**Feasibility demonstrated on a user's Windows PC with a local MP4 (2026-11-21).** This remains an experiment, not a release-ready player or a performance benchmark.
 
 ## Run locally on Windows 10/11
 
@@ -48,10 +48,10 @@ After updating the implementation, compile again with `cargo build --release --m
 
 | Check | Status |
 | --- | --- |
-| Rust typecheck and action tests on Windows CI | Passed (run 44919931325); runtime unverified |
-| Native playback and compositing on Windows (user smoke test) | Local clip plays; progress-fill alignment patch awaits visual retest |
-| Pause, seek, resize and fullscreen without player recreation | Not yet measured |
-| Hardware/software decode and frame pacing | Not yet measured |
+| Rust typecheck and action tests on Windows CI | Passed, including progress-bar fix ([run 44926286125](https://github.com/rteats/yt-lite/actions/runs/44926286125)) |
+| Native playback and compositing on Windows (user smoke test) | **Pass**: local clip plays in native window, overlay visible, progress fill corrected |
+| Playback controls, resize and fullscreen | Resize and fullscreen **pass** user test; progress bar **pass**. Pause and seek were implemented/tested at the command level but not individually reported in user feedback; no unexpected recreation reported |
+| Hardware/software decode and frame pacing | Performance and frame pacing **look good subjectively** in user test; no quantitative profiling, dropped-frame data or verified decoder selection |
 | Clean-system runtime DLL packaging, licenses | Separate issue #4 |
 
 ## Risks / fallback
@@ -64,12 +64,20 @@ After updating the implementation, compile again with `cargo build --release --m
 
 ## User smoke-test feedback (2026-11-21)
 
-A user launched the built prototype with a local MP4 and confirmed the player works.
-The blue progress bar initially grew from the middle toward both sides rather than
-left-to-right. The fill rectangle now explicitly sets `x: 0px; y: 0px`;
-this change needs a **visual retest** on the user's Windows machine.
-A functioning local clip does not independently establish hardware decode,
-frame pacing, overlay persistence through resize, or all seek/fullscreen criteria.
+A user launched the built prototype with a local MP4 and confirmed video playback.
+The progress bar initially filled from its center toward both sides. Anchoring
+the fill rectangle at `x: 0px; y: 0px` fixed the visual problem, as confirmed
+by the user's subsequent retest.
+
+The user also confirmed **resize and fullscreen work** and reported that
+performance and frame pacing **appear good** during use. This establishes
+basic feasibility of the Slint/libmpv rendering arrangement and overlay.
+
+Remaining unmeasured production-quality details: actual hardware decode mode,
+quantitative dropped-frame and frame-time data, repeatability across GPU
+configurations, release binary licensing/packaging, and individually reported
+pause/seek behavior. Do not interpret subjective frame pacing as a benchmark.
+These are follow-up engineering checks, not blockers for the initial concept.
 
 Visual regression check: at 0%, 25%, 50%, and 100% of clip duration,
 verify the blue region begins at the left edge and fills that fraction
