@@ -7,7 +7,7 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract, Provider};
+use yt_lite_extraction_proof::{canonical_video_url, extract, HttpPlaybackHeaders, Provider};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
@@ -101,6 +101,7 @@ struct ResolvedStream {
     url: String,
     title: String,
     provider: Provider,
+    headers: HttpPlaybackHeaders,
 }
 
 type StreamResolution = Result<ResolvedStream, String>;
@@ -125,6 +126,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> R
                     url: stream.url.clone(),
                     title: info.title,
                     provider,
+                    headers: stream.http_headers.clone(),
                 })
             })
         })();
@@ -323,7 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         active_provider = stream.provider;
                         media_title = Some(stream.title);
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
-                        match label_player.borrow_mut().load_network_stream(&stream.url) {
+                        match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
                             Ok(()) => {
                                 load_started = Some(Instant::now());
                                 file_loaded = false;
