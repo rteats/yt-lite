@@ -207,10 +207,10 @@ fn formats(root: &Value) -> Capability<Stream> {
         let url = string(&v["url"])?;
         let format_id = string(at(v, &["format_id", "formatId"]))
             .or_else(|| integer(&v["itag"]).map(|n| n.to_string()))?;
-        let has_video = v.get("has_video").and_then(Value::as_bool)
+        let has_video = at(v, &["hasVideo", "has_video"]).as_bool()
             .unwrap_or_else(|| v.get("vcodec").and_then(Value::as_str).map(|c| c != "none")
                 .unwrap_or_else(|| integer(&v["height"]).is_some()));
-        let has_audio = v.get("has_audio").and_then(Value::as_bool)
+        let has_audio = at(v, &["hasAudio", "has_audio"]).as_bool()
             .unwrap_or_else(|| v.get("acodec").and_then(Value::as_str).map(|c| c != "none")
                 .unwrap_or(false));
         Some(Stream { format_id, url, width: integer(&v["width"]), height: integer(&v["height"]),
@@ -276,8 +276,8 @@ pub fn parse_provider_json(provider: Provider, expected_id: &str, json: &str) ->
     }
     let thumbnail = string(&details["thumbnail"]).or_else(||
         at(details, &["thumbnails"]).as_array().and_then(|a| a.last()).and_then(|item| string(&item["url"])));
-    let channel = string(at(details, &["channel", "uploader", "owner_channel_name", "author"]));
-    let duration_seconds = integer(at(details, &["duration", "length_seconds", "durationSeconds"]));
+    let channel = string(at(details, &["channel", "uploader", "ownerChannelName", "owner_channel_name", "author"]));
+    let duration_seconds = integer(at(details, &["duration", "lengthSeconds", "length_seconds", "durationSeconds"]));
     Ok(ExtractionResult {
         provider, video_id: expected_id.into(), title, channel, duration_seconds, thumbnail,
         streams: formats(&value), captions: captions(&value), chapters: chapters(details),
