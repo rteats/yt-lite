@@ -247,6 +247,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_error: Option<String> = None;
     let mut load_started: Option<Instant> = None;
     let mut file_loaded = false;
+    let mut file_loaded_at: Option<Instant> = None;
+    let mut playback_advanced = false;
     let mut has_network_media = false;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
@@ -263,6 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if load_started.is_some() {
                         load_started = None;
                         file_loaded = true;
+                        file_loaded_at = Some(Instant::now());
                         eprintln!("[yt-lite] {} media loaded; streaming", provider_label(active_provider));
                     }
                 }
@@ -280,6 +283,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(start) = load_started {
             if start.elapsed() > Duration::from_secs(30) {
                 failure.get_or_insert_with(|| "mpv did not load the network stream in 30 seconds".into());
+            }
+        }
+
+        // FILE_LOADED alone does not prove media decoding. If an allegedly
+        // playable stream never advances, retry rather than showing 00:00.
+        if let Some(start) = file_loaded_at {
+            let position = label_player.borrow().property_double(c"time-pos").unwrap_or(0.0);
+            if position > 0.1 { playback_advanced = true; }
+            let manually_paused = label_player.borrow().property_flag(c"pause").unwrap_or(false);
+            if !playback_advanced && !manually_paused && start.elapsed() > Duration::from_secs(20) {
+                failure.get_or_insert_with(|| "No decoded playback progress within 20 seconds".into());
             }
         }
 
@@ -313,6 +327,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(()) => {
                                 load_started = Some(Instant::now());
                                 file_loaded = false;
+                                file_loaded_at = None;
+                                playback_advanced = false;
                                 has_network_media = true;
                             }
                             Err(err) => failure = Some(err),
@@ -337,6 +353,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     media_title = None;
                     load_started = None;
                     file_loaded = false;
+                    file_loaded_at = None;
+                    playback_advanced = false;
                     has_network_media = false;
                 } else {
                     playback_error = Some(err);
@@ -346,6 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 playback_error = Some(err);
                 resolving = false;
                 load_started = None;
+                file_loaded_at = None;
             }
         }
 
