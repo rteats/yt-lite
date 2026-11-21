@@ -5,7 +5,7 @@ This is a **Windows x64 feasibility experiment**, not a release, not yet a verif
 ## Run locally on Windows 10/11
 
 1. Build the prototype: `cargo build --release --manifest-path experiments/native-player/Cargo.toml`.
-2. Place a compatible x64 `mpv-2.dll` and its **required runtime DLL dependencies** next to `target/release/yt-lite-native-player-proof.exe` (or run the corresponding debug executable with the DLLs alongside it). Do not use an unofficial DLL.
+2. Download a current `mpv-dev-x86_64-*.7z` libmpv archive from the [Windows builds listed by mpv](https://mpv.io/installation/) (for example, [shinchiro's libmpv files](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)). Extract the **x64** `libmpv-2.dll` or `mpv-2.dll` from the archive, and place it in `experiments/native-player/target/release/` alongside the EXE. Copy any additional required DLL dependencies from the same trusted package if needed; don't use random DLL-download sites. The experiment deliberately does not redistribute media-engine binaries or their licenses.
 3. Use your own non-DRM local 1080p H.264 MP4 test clip, then launch:
 
 ```powershell
@@ -13,6 +13,21 @@ This is a **Windows x64 feasibility experiment**, not a release, not yet a verif
 ```
 
 The crate uses the default, isolated Cargo `target` directory under `experiments/native-player`; adjust the command if you override `CARGO_TARGET_DIR`.
+
+### Troubleshooting `LoadLibraryExW failed`
+
+From the repository root, check which DLL (if any) is beside the EXE:
+
+```powershell
+$bin = ".\\experiments\\native-player\\target\\release"
+Get-ChildItem $bin -Filter "*mpv*.dll"
+```
+
+- **No matching DLL:** the program cannot run yet. Extract the x64 `libmpv-2.dll` from an `mpv-dev-x86_64` archive into `$bin`; do not put it in the repository root.
+- **Matching DLL present but loading still fails:** Windows may be missing a dependency of that DLL (or the DLL may have the wrong architecture). Keep the package's required DLLs together; diagnose missing modules with [Dependencies](https://github.com/lucasg/Dependencies) rather than downloading arbitrary DLLs.
+- **The clip argument is missing:** provide the full path to an existing MP4 or other supported local video.
+
+After updating the implementation, compile again with `cargo build --release --manifest-path experiments/native-player/Cargo.toml`, then run the EXE with the clip path.
 
 - Seek by +/-10 seconds, click the scrub bar, pause/resume, resize, and toggle fullscreen.
 - Inspect video **beneath** the Slint overlay. Verify that none of these operations creates a second player or restarts the clip.
@@ -26,14 +41,14 @@ The crate uses the default, isolated Cargo `target` directory under `experiments
 - `RenderingSetup` creates the OpenGL render context; `BeforeRendering` draws video into the current framebuffer; Slint draws a transparent overlay above it; `RenderingTeardown` frees the context.
 - Frame notifications enter the Slint event loop through a queued weak component handle, never directly from the mpv callback thread.
 - Playback commands are asynchronous, and the control-action mapping is separately tested without a DLL or video asset.
-- `mpv-2.dll` is loaded from the **executable directory only**. The prototype intentionally does not download or bundle third-party binaries.
+- `libmpv-2.dll` or `mpv-2.dll` is loaded from the **executable directory only**. The prototype intentionally does not download or bundle third-party binaries.
 - The Windows WGL + desktop-OpenGL path is selected deliberately to avoid pretending untested ANGLE/Direct3D hardware-interoperability is proven.
 
 ## Verification matrix
 
 | Check | Status |
 | --- | --- |
-| Rust typecheck and action tests on Windows CI | Pending GitHub Actions |
+| Rust typecheck and action tests on Windows CI | Passed (run 44919931325); runtime unverified |
 | Native playback and compositing on Windows 10 x64 | Not yet measured |
 | Pause, seek, resize and fullscreen without player recreation | Not yet measured |
 | Hardware/software decode and frame pacing | Not yet measured |
