@@ -1,5 +1,5 @@
 #![cfg(target_os = "windows")]
-//! Standalone issue #2 prototype: one Slint window, one libmpv core, one GL render context.
+//! Native watch-shell increment: one Slint window and one libmpv core.
 //! Experimental local-file and YouTube URL playback, not a release-ready watch page.
 
 mod mpv;
@@ -11,23 +11,67 @@ use yt_lite_extraction_proof::{canonical_video_url, extract, HttpPlaybackHeaders
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
-    import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+    import { Button, HorizontalBox, VerticalBox, LineEdit } from "std-widgets.slint";
 
     export component PlayerWindow inherits Window {
-        title: "yt-lite / native playback proof";
+        title: "yt-lite / watch";
         preferred-width: 1000px;
         preferred-height: 640px;
-        min-width: 560px;
+        min-width: 660px;
         min-height: 300px;
         background: transparent;
 
         in-out property <bool> paused: false;
         in-out property <float> fraction: 0;
-        in-out property <string> status: "Opening source...";
+        in-out property <string> status: "Paste a YouTube URL above to begin."; 
+        in-out property <string> url-text: "";
+        in-out property <bool> has-url: false;
+        in-out property <bool> dark-mode: true;
+        callback open-url(string);
+        callback open-browser();
         callback toggle-pause();
         callback seek-by(int);
         callback seek-to(float);
         callback toggle-fullscreen();
+
+        // An interactive native watch header over the video render surface.
+        // LineEdit offers keyboard focus/paste, and Enter also opens the URL.
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 64px;
+            background: root.dark-mode ? #ee1b202b : #f1f4f6;
+            HorizontalBox {
+                padding: 10px;
+                spacing: 8px;
+                Text {
+                    text: "yt-lite";
+                    color: root.dark-mode ? white : #19242f;
+                    font-size: 18px;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    horizontal-stretch: 1;
+                    text <=> root.url-text;
+                    placeholder-text: "Paste a YouTube video URL...";
+                    accepted(text) => { root.open-url(text); }
+                }
+                Button {
+                    text: "Open";
+                    clicked => { root.open-url(root.url-text); }
+                }
+                Button {
+                    text: "Browser";
+                    enabled: root.has-url;
+                    clicked => { root.open-browser(); }
+                }
+                Button {
+                    text: root.dark-mode ? "Light" : "Dark";
+                    clicked => { root.dark-mode = !root.dark-mode; }
+                }
+            }
+        }
 
         // The transparent window is deliberate: libmpv draws the GL underlay
         // before Slint paints these controls over it.
@@ -36,13 +80,13 @@ slint::slint! {
             height: 106px;
             x: 0px;
             y: parent.height - self.height;
-            background: #d51b202b;
+            background: root.dark-mode ? #d51b202b : #e9f5f5f7;
             VerticalBox {
                 padding: 10px;
                 spacing: 9px;
                 Text {
                     text: root.status;
-                    color: white;
+                    color: root.dark-mode ? white : #19242f;
                     font-size: 13px;
                     vertical-alignment: center;
                 }
