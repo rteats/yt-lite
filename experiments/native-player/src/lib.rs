@@ -24,3 +24,22 @@ pub fn command_for(action: PlaybackAction) -> Option<Vec<String>> {
         _ => None,
     }
 }
+
+
+/// Pick the highest-resolution HTTP(S) stream that already contains both
+/// video and audio. Never select video-only tracks without a matching audio
+/// input: feeding only that URL to mpv would produce silent playback.
+pub fn select_muxed_stream(
+    info: &yt_lite_extraction_proof::ExtractionResult,
+) -> Option<&yt_lite_extraction_proof::Stream> {
+    match &info.streams {
+        yt_lite_extraction_proof::Capability::Available(streams) => streams
+            .iter()
+            .filter(|stream| {
+                stream.has_video && stream.has_audio
+                    && (stream.url.starts_with("https://") || stream.url.starts_with("http://"))
+            })
+            .max_by_key(|stream| (stream.height.unwrap_or(0), stream.width.unwrap_or(0))),
+        _ => None,
+    }
+}
