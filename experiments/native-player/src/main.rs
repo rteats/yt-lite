@@ -382,8 +382,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // This may also fire when retrying; do not interpret as playback.
                 }
                 PlaybackEvent::FileLoaded => {
-                    if let Some(ui) = label_window.upgrade() {
-                        ui.set_has_media(true);
+                    if (remote_url.is_none() || load_started.is_some()) && label_window.upgrade().is_some() {
+                        if let Some(ui) = label_window.upgrade() {
+                            ui.set_has_media(true);
+                        }
                     }
                     if load_started.is_some() {
                         load_started = None;
@@ -491,6 +493,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolving = false;
                 load_started = None;
                 file_loaded_at = None;
+                if let Some(ui) = label_window.upgrade() {
+                    ui.set_has_media(false);
+                }
             }
         }
 
