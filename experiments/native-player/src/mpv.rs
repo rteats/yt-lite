@@ -6,6 +6,7 @@
 
 use crate::PlayerWindow;
 use yt_lite_native_player_proof::NETWORK_STREAM_OPTIONS;
+use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
 use std::{
@@ -75,6 +76,7 @@ struct Api {
     initialize: unsafe extern "C" fn(*mut c_void) -> c_int,
     terminate_destroy: unsafe extern "C" fn(*mut c_void),
     set_option_string: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
+    set_property_string: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     command_async: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
     render_create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const RenderParam) -> c_int,
@@ -95,6 +97,7 @@ impl Api {
             initialize: get(library, b"mpv_initialize\0")?,
             terminate_destroy: get(library, b"mpv_terminate_destroy\0")?,
             set_option_string: get(library, b"mpv_set_option_string\0")?,
+            set_property_string: get(library, b"mpv_set_property_string\0")?,
             command_async: get(library, b"mpv_command_async\0")?,
             get_property: get(library, b"mpv_get_property\0")?,
             render_create: get(library, b"mpv_render_context_create\0")?,
@@ -229,15 +232,37 @@ impl Player {
         !self.context.is_null()
     }
 
-    pub fn load_network_stream(&mut self, url: &str) -> Result<(), String> {
+    pub fn load_network_stream(
+        &mut self,
+        url: &str,
+        headers: &HttpPlaybackHeaders,
+    ) -> Result<(), String> {
         if !self.is_render_ready() {
             return Err("libmpv render context is not ready yet".into());
         }
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return Err("Extractor returned a non-HTTP streaming URL".into());
         }
+        // yt-dlp can supply request-specific headers for signed URLs. Forward
+        // only user agent and referer, never cookies or authorization tokens.
+        if let Some(ref agent) = headers.user_agent {
+            self.set_string_property(c"user-agent", agent)?;
+        }
+        if let Some(ref referer) = headers.referer {
+            self.set_string_property(c"referrer", referer)?;
+        }
         self.send_loadfile(url)?;
         self.loaded = true;
+        Ok(())
+    }
+
+    fn set_string_property(&self, name: &CStr, value: &str) -> Result<(), String> {
+        let cvalue = CString::new(value)
+            .map_err(|_| "Extractor returned an invalid HTTP header".to_string())?;
+        let rc = unsafe { (self.api.set_property_string)(self.handle, name.as_ptr(), cvalue.as_ptr()) };
+        if rc < 0 {
+            return Err(format!("mpv rejected HTTP request setting (code {rc})"));
+        }
         Ok(())
     }
 
