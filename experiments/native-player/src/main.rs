@@ -122,11 +122,13 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> R
                 let stream = select_muxed_stream(&info).ok_or_else(|| {
                     "No combined audio+video HTTP stream available from this provider".to_string()
                 })?;
+                let media_url = stream.url.clone();
+                let headers = stream.http_headers.clone();
                 Ok(ResolvedStream {
-                    url: stream.url.clone(),
+                    url: media_url,
                     title: info.title,
                     provider,
-                    headers: stream.http_headers.clone(),
+                    headers,
                 })
             })
         })();
