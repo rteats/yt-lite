@@ -13,7 +13,7 @@ cargo run -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider yt-dlp --y
 cargo run -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider auto
 ```
 
-The default output is a **privacy-safe JSON capability summary** containing provider, video ID, duration, stream counts, captions and chapters. It intentionally excludes stream/caption URLs, thumbnails and channel/title metadata. Each capability distinguishes `available`, `unavailable` and `unknown`. `unknown` means not reported, not necessarily absent.
+The default output is a **privacy-safe JSON capability summary** containing provider, duration, stream counts, captions and chapters. It intentionally excludes video IDs, stream/caption URLs, thumbnails and channel/title metadata. Each capability distinguishes `available`, `unavailable` and `unknown`. `unknown` means not reported, not necessarily absent.
 
 `--provider auto` (default) falls back to yt-dlp when the Rust extraction route fails or returns no streams. Supply `--yt-dlp PATH` if the helper is not on `PATH`.
 
