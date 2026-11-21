@@ -69,9 +69,8 @@ Standard Slint `Button` and `LineEdit` widgets have their own
 The toggle now sets `Palette.color-scheme` to `ColorScheme.light` or
 `ColorScheme.dark`, and the watch overlay derives its own colors from
 that palette. This keeps text, placeholder, enabled/disabled and input
-colors consistent with the active widget theme. Confirm visually on
-Windows, including the URL field, Open/Browser/Light buttons and the
-transport controls.
+colors consistent with the active widget theme. The user confirmed the light-theme contrast is now readable on
+Windows, including the watch-shell controls.
 
 ### Optional timing diagnostics
 
@@ -110,6 +109,56 @@ the complete video.
 Latency optimization remains an explicit follow-up for the real player;
 the feasibility spike established correctness, not YouTube-web
 performance parity.
+
+## Measured startup and seek baseline (2026-11-21)
+
+The user rebuilt the branch on Windows: all 7 native-player tests passed,
+release compilation passed, and the light theme now has appropriate contrast.
+
+| Playback attempt | yt-dlp extraction | libmpv media load | Combined to `FILE_LOADED` |
+| --- | ---: | ---: | ---: |
+| 1 | 6,370 ms | 758 ms | 7,128 ms |
+| 2 | 5,282 ms | 1,249 ms | 6,531 ms |
+| 3 | 7,755 ms | 784 ms | 8,539 ms |
+| **Mean** | **6,469 ms** | **930 ms** | **7,399 ms** |
+
+15 seek-to-`PLAYBACK_RESTART` timings: median **164 ms**, mean **277
+ms**, 12 of 15 below 250 ms, three slow samples **712, 878, and 990 ms**.
+These are event latencies, not exact visible frame presentation times.
+The sample does not identify video IDs, cold/warm cache conditions or
+matched timings from the official website; do not imply exact parity
+or quantify a browser-vs-native difference from this data.
+
+The **yt-dlp extraction stage accounts for about 87%** of the measured
+extract+load interval. Optimize it first, while separately investigating
+out-of-buffer seeks. Avoid tuning cache or dropping format/caption
+capabilities without an A/B measurement.
+
+### Reproducible yt-dlp extraction variants
+
+A PowerShell benchmark compares the existing extractor invocation with
+two official, documented but **potentially capability-reducing** options.
+It prints only timings and media/caption counts; no raw JSON, signed
+stream URLs or metadata are persisted.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\experiments\native-player\bench-yt-dlp.ps1 -Repetitions 2
+```
+
+Variants:
+- `baseline`: the current reliable extractor configuration
+- `skip_translated_subs`: `youtube:skip=translated_subs`
+- `skip_manifests`: `youtube:skip=hls,dash,translated_subs`
+
+**Do not enable a variant in the actual player based only on a faster
+benchmark number.** Check that at least one muxed audio+video format
+remains; verify audible playback and seeking on multiple public videos.
+Skipping translated subtitles disables potential caption capabilities,
+and skipping manifests can eliminate formats, especially on live/HLS
+sources. The full extractor remains the default until a measured
+optimization preserves required user-facing behavior.
+
+Tracked in [issue #30](https://github.com/rteats/yt-lite/issues/30).
 
 ## Provider policy
 
