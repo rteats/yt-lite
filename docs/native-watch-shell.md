@@ -54,6 +54,63 @@ installed local helpers; this branch is not a redistributable package.
 Do **not** share `--raw-json` or signed streaming URLs. The standard
 console output should not include raw media URLs.
 
+## Light theme contrast and playback latency review (2026-11-21)
+
+The user's Windows smoke test confirmed that the watch window, URL opening,
+audio/video playback and basic controls worked. The user also reported two
+issues: light mode kept **white text on light widgets**, and yt-dlp/seek
+latency appeared higher than the YouTube website.
+
+### Theme fix
+
+The original toggle changed only custom `Rectangle`/ `Text` colors.
+Standard Slint `Button` and `LineEdit` widgets have their own
+`Palette.color-scheme` and therefore kept the wrong widget contrast.
+The toggle now sets `Palette.color-scheme` to `ColorScheme.light` or
+`ColorScheme.dark`, and the watch overlay derives its own colors from
+that palette. This keeps text, placeholder, enabled/disabled and input
+colors consistent with the active widget theme. Confirm visually on
+Windows, including the URL field, Open/Browser/Light buttons and the
+transport controls.
+
+### Optional timing diagnostics
+
+The user-reported delay is an open performance finding, **not disproven**
+by successful playback. The native binary supports `--timings`:
+
+```powershell
+$exe = ".\\experiments\\native-player\\target\\release\\yt-lite-native-player-proof.exe"
+$helper = (Get-Command yt-dlp -ErrorAction Stop).Source
+& $exe --provider auto --yt-dlp $helper --timings
+```
+
+Paste a public watch URL and seek to several positions. Only these
+sanitized timing lines are needed for review:
+
+- `[yt-lite] timing yt-dlp-extract=...ms`: async worker runtime plus
+  yt-dlp resolution, before any media is passed to libmpv
+- `[yt-lite] timing libmpv-load=...ms`: load command to `FILE_LOADED`;
+  *not* necessarily first decoded/displayed frame
+- `[yt-lite] timing seek-to-playback-restart=...ms`: seek command
+  submission to libmpv's `PLAYBACK_RESTART` event; a useful seek
+  latency proxy but not a precise frame-display timestamp
+
+Logs contain neither signed media URLs nor original watch URLs. Do not
+share extra raw mpv debug logs or signed stream URLs.
+
+The current yt-dlp extractor launches a local helper and performs
+YouTube challenge resolution before libmpv can begin loading the selected
+signed media. The browser already has page data and YouTube-specific
+streaming machinery. mpv may also have different demuxing and HTTP
+seek/cache behavior. Neither difference is yet quantified locally; avoid
+claiming a specific bottleneck or tweaking cache sizes until measured.
+The prototype **still streams incrementally** and does not predownload
+the complete video.
+
+Latency optimization remains an explicit follow-up for the real player;
+the feasibility spike established correctness, not YouTube-web
+performance parity.
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
