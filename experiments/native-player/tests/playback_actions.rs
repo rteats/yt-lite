@@ -9,6 +9,8 @@ fn play_pause_is_a_single_command_without_replacing_the_session() {
 fn relative_seek_is_preserved_in_seconds() {
     assert_eq!(command_for(PlaybackAction::SeekRelative(-10)), Some(vec!["seek".into(), "-10".into(), "relative".into()]));
     assert_eq!(command_for(PlaybackAction::SeekRelative(10)), Some(vec!["seek".into(), "10".into(), "relative".into()]));
+    assert_eq!(command_for(PlaybackAction::SeekRelative(i64::MIN)), None);
+    assert_eq!(command_for(PlaybackAction::SeekRelative(i64::MAX)), None);
 }
 
 #[test]
