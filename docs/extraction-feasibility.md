@@ -142,6 +142,37 @@ The 1,139 caption entries are raw selectable track/format entries, **not
 1,139 languages**. Distinct-language grouping and user selection belong
 to the future subtitle controls.
 
+## Third Windows live probe — 2026-11-21
+
+After the storyboard filter and muxed/video-only counters were added, the user
+ran `git pull --ff-only` and `cargo build --release` successfully.
+
+| Provider | Media streams | Muxed (audio + video) | Video-only | Audio-only | Duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `rust` | 1 | 1 | 0 | 0 | 213 s |
+| `yt-dlp` | 43 | 1 | 37 | 5 | 213 s |
+
+The yt-dlp parser correctly dropped 6 storyboard/non-media entries from its
+previous reported 49 formats. The Rust response explicitly marks its only
+format as *muxed*: it includes both audio and video according to the extractor,
+so a separate audio format is not required for that URL.
+
+Rust captions remain `unknown`, chapters `unavailable`; yt-dlp reports
+1,139 caption track/format entries (1,104 automatic), chapters `unknown`.
+These are track entries, **not distinct languages**.
+
+**Confirmed:** successful metadata and typed format extraction via both
+provider routes, correct duration and stream-role classification on the
+tested public URL, and a reproducible Windows release build.
+
+**Still unverified:** a real HTTP playback request to any selected stream,
+hardware decoding of that stream, behavior on Shorts/live/restricted videos,
+chapter-bearing videos, and fallback when Rust fails or its returned media
+URL cannot actually play. The default `auto` still chooses the Rust
+muxed stream; it does not merge caption data from yt-dlp. This is expected
+under the present limited route-selection policy; richer capability-level
+fallback is scoped to issue #22.
+
 ## Dependencies and provenance
 
 - `rusty_ytdl` 0.7.4 is MIT OR Apache-2.0 per docs.rs. The user's public-video probe successfully returned metadata and one stream, but playback URL validity and general compatibility are still unverified.
