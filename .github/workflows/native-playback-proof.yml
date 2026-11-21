@@ -1,0 +1,24 @@
+name: Native playback proof (Windows compilation)
+
+on:
+  push:
+    paths:
+      - "experiments/native-player/**"
+      - ".github/workflows/native-playback-proof.yml"
+  pull_request:
+    paths:
+      - "experiments/native-player/**"
+      - ".github/workflows/native-playback-proof.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experiments/native-player
+      - run: cargo check --manifest-path experiments/native-player/Cargo.toml --all-targets
+      - run: cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets
