@@ -12,7 +12,7 @@ pub enum PlaybackAction {
 pub fn command_for(action: PlaybackAction) -> Option<Vec<String>> {
     match action {
         PlaybackAction::TogglePause => Some(vec!["cycle".into(), "pause".into()]),
-        PlaybackAction::SeekRelative(seconds) if seconds.abs() <= 3600 => {
+        PlaybackAction::SeekRelative(seconds) if seconds.checked_abs().is_some_and(|magnitude| magnitude <= 3600) => {
             Some(vec!["seek".into(), seconds.to_string(), "relative".into()])
         }
         PlaybackAction::SeekFraction { fraction, duration_seconds }
