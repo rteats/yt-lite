@@ -10,7 +10,7 @@
 - The highest-resolution muxed format is loaded as one signed streaming URL. No stream URL, token, or raw extractor output is printed in logs.
 - An invalid video link or a local-file mistake is rejected. Existing local-file playback remains available.
 
-**This does not implement:** separate video+audio track pairing, quality selection, read-only media info panels, thumbnails, subtitles, full live recovery, signed-URL refreshing, or network header forwarding. It now captures asynchronous libmpv load errors but still does not cover every decoder/network failure. These are needed before treating YouTube playback as a finished feature.
+**This does not implement:** separate video+audio track pairing, quality selection, read-only media info panels, thumbnails, subtitles, full live recovery, signed-URL refreshing, or forwarding every possible network header. The spike now forwards only User-Agent and Referer from yt-dlp, never cookies or authorization. It now captures asynchronous libmpv load errors but still does not cover every decoder/network failure. These are needed before treating YouTube playback as a finished feature.
 
 ## Windows run
 
@@ -68,6 +68,18 @@ to download media files**. libmpv uses an in-memory cache limited by
 `cache-secs=8`, `cache-on-disk=no`. This allows incremental playback
 after initial buffering instead of waiting to download the entire video.
 The network connection may still fail or buffer while loading.
+
+### yt-dlp request-header compatibility
+
+A selected yt-dlp format can contain request-specific `http_headers`. The
+stream parser now reads only `User-Agent` and `Referer`, with format-level
+values taking precedence over video-level values, and forwards those through
+libmpv's `user-agent` and `referrer` properties before starting HTTP
+streaming. Cookies, Authorization and other headers are deliberately omitted,
+and request headers/signatures are not written to user-visible logs.
+
+This may resolve HTTP access failures for externally played signed URLs,
+but **has not been verified as the root cause** of the original black screen.
 
 ### Repeatable troubleshooting
 
