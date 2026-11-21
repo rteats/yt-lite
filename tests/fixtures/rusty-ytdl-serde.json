@@ -1,0 +1,38 @@
+{
+  "videoDetails": {
+    "videoId": "dQw4w9WgXcQ",
+    "title": "Schema sample",
+    "ownerChannelName": "Schema channel",
+    "lengthSeconds": "212",
+    "thumbnails": [{"url": "https://i.ytimg.com/example.jpg"}],
+    "chapters": [
+      {"title": "Beginning", "startTime": 0},
+      {"title": "Second", "startTime": 35}
+    ]
+  },
+  "formats": [
+    {
+      "itag": 18,
+      "url": "https://example.test/combined",
+      "width": 640,
+      "height": 360,
+      "fps": 30,
+      "hasVideo": true,
+      "hasAudio": true
+    },
+    {
+      "itag": 140,
+      "url": "https://example.test/audio-only",
+      "hasVideo": false,
+      "hasAudio": true
+    },
+    {
+      "itag": 137,
+      "url": "https://example.test/video-only",
+      "width": 1920,
+      "height": 1080,
+      "hasVideo": true,
+      "hasAudio": false
+    }
+  ]
+}
