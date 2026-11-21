@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg"] }
 libloading = "0.8"
+webbrowser = "1.0"
 yt-lite-extraction-proof = { path = "../.." }
 tokio = { version = "1", features = ["rt", "time"] }
 
