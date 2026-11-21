@@ -43,3 +43,28 @@ pub fn select_muxed_stream(
         _ => None,
     }
 }
+
+
+/// A bounded in-memory libmpv demuxer cache for HTTP streaming. This is not
+/// a full-file download: playback begins as soon as enough data is buffered.
+pub const NETWORK_STREAM_OPTIONS: &[(&str, &str)] = &[
+    ("cache", "yes"),
+    ("cache-on-disk", "no"),
+    ("cache-secs", "8"),
+    ("demuxer-max-bytes", "16MiB"),
+    ("demuxer-max-back-bytes", "4MiB"),
+    ("network-timeout", "20"),
+];
+
+/// With 'auto', retry from yt-dlp if the Rust URL fails during playback,
+/// not just if the extractor itself fails. Explicit provider choices are strict.
+pub fn fallback_after_playback_error(
+    failed: yt_lite_extraction_proof::Provider,
+    requested: yt_lite_extraction_proof::Provider,
+) -> Option<yt_lite_extraction_proof::Provider> {
+    use yt_lite_extraction_proof::Provider;
+    match (failed, requested) {
+        (Provider::Rust, Provider::Auto) => Some(Provider::YtDlp),
+        _ => None,
+    }
+}
