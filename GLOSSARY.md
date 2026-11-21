@@ -42,8 +42,11 @@ _Avoid_: Playback queue
 A profile-owned reference to deliberately downloaded media available for offline playback, including retained metadata. Multiple profiles may refer to the same stored media.
 _Avoid_: Cache entry
 
+**Media variant**:
+A separately retained quality, format, codec, or track configuration of the same video. Different variants are not interchangeable even if they share a video ID.
+
 **Stored media**:
-The downloaded media data retained on disk and potentially referenced by more than one offline library item.
+The downloaded media data retained on disk and potentially referenced by more than one offline library item or profile. Identical stored media can be deduplicated.
 _Avoid_: Offline library item
 
 **Cache entry**:

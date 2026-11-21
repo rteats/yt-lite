@@ -1,5 +1,5 @@
 # Fully bundled Windows releases with lightweight-first behavior
 
-yt-lite will ship portable and installer-based Windows distributions with required runtime components bundled; end users should not need to install mpv, FFmpeg, Python, or extraction tools manually. Minimized idle memory, CPU, startup work, and background activity take priority over elaborate animations and always-on prefetching.
+yt-lite will ship portable and installer-based Windows 10/11 x64 distributions with required runtime components bundled; end users should not need to install mpv, FFmpeg, Python, or extraction tools manually. Windows ARM64 and Linux builds are later targets. Minimized idle memory, CPU, startup work, and background activity take priority over elaborate animations and always-on prefetching.
 
 **Consequences:** Bundling increases packaging and licensing work; independently updated extraction components must remain verifiable and reversible. Performance budgets will be established through measurements on both development and lower-end reference hardware, not invented targets. Closing the main window exits by default; continuing playback in the system tray is opt-in. Optional URL/protocol and command-line integration should not require a background service. Application update checks are optional and require approval before installation.
