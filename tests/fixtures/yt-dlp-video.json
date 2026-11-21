@@ -1,0 +1,14 @@
+{
+  "id": "dQw4w9WgXcQ",
+  "title": "Sample music video",
+  "channel": "Sample channel",
+  "duration": 212,
+  "thumbnail": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+  "formats": [
+    {"format_id": "18", "url": "https://example.test/stream2", "width": 640, "height": 360, "fps": 30, "vcodec": "avc1", "acodec": "mp4a"},
+    {"format_id": "140", "url": "https://example.test/audio2", "vcodec": "none", "acodec": "mp4a"}
+  ],
+  "subtitles": {"en": [{"ext": "vtt", "url": "https://example.test/en.vtt"}]},
+  "automatic_captions": {"pl": [{"ext": "vtt", "url": "https://example.test/pl.vtt"}]},
+  "chapters": [{"title": "Introduction", "start_time": 0, "end_time": 20}]
+}

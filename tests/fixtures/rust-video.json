@@ -1,0 +1,14 @@
+{
+  "video_details": {
+    "video_id": "dQw4w9WgXcQ",
+    "title": "Sample music video",
+    "owner_channel_name": "Sample channel",
+    "length_seconds": "212",
+    "thumbnails": [{"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"}],
+    "chapters": [{"title": "Introduction", "start_time": 0, "end_time": 20}]
+  },
+  "formats": [
+    {"itag": 18, "url": "https://example.test/stream1", "width": 640, "height": 360, "fps": 30, "has_video": true, "has_audio": true},
+    {"itag": 140, "url": "https://example.test/audio", "has_video": false, "has_audio": true}
+  ]
+}
