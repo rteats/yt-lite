@@ -99,3 +99,26 @@ fn storyboard_only_response_has_no_playable_streams() {
     let result = parse_provider_json(Provider::YtDlp, ID, payload).unwrap();
     assert_eq!(result.streams, Capability::Unavailable);
 }
+
+
+#[test]
+fn yt_dlp_stream_headers_are_per_format_and_not_arbitrary_cookies() {
+    let json = r#"{
+        "id":"dQw4w9WgXcQ", "title":"HTTP stream",
+        "http_headers":{"User-Agent":"DefaultUA","Referer":"https://www.youtube.com/"},
+        "formats":[
+            {"format_id":"18","url":"https://example.test/combined",
+             "vcodec":"avc1","acodec":"mp4a",
+             "http_headers":{"User-Agent":"FormatUA","Cookie":"SECRET","Referer":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}}
+        ]
+    }"#;
+    let result = parse_provider_json(Provider::YtDlp, ID, json).unwrap();
+    match result.streams {
+        Capability::Available(formats) => {
+            assert_eq!(formats[0].http_headers.user_agent.as_deref(), Some("FormatUA"));
+            assert_eq!(formats[0].http_headers.referer.as_deref(), Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+            assert!(!format!("{:?}", formats[0].http_headers).contains("SECRET"));
+        }
+        _ => panic!("expected HTTP stream"),
+    }
+}
