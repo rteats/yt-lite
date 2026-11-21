@@ -5,6 +5,7 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
+use yt_lite_native_player_proof::NETWORK_STREAM_OPTIONS;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
 use std::{
@@ -36,6 +37,38 @@ struct OpenGlFbo {
 
 type RenderUpdate = Option<unsafe extern "C" fn(*mut c_void)>;
 
+#[repr(C)]
+struct MpvEvent {
+    event_id: c_int,
+    error: c_int,
+    reply_userdata: u64,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct MpvEndFile {
+    reason: c_int,
+    error: c_int,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackEvent {
+    StartFile,
+    FileLoaded,
+    LoadFailed(i32),
+    Ended,
+}
+
+// mpv/client.h: START_FILE=6, END_FILE=7, FILE_LOADED=8,
+// COMMAND_REPLY=5; MPV_END_FILE_REASON_ERROR=4.
+const MPV_EVENT_NONE: c_int = 0;
+const MPV_EVENT_COMMAND_REPLY: c_int = 5;
+const MPV_EVENT_START_FILE: c_int = 6;
+const MPV_EVENT_END_FILE: c_int = 7;
+const MPV_EVENT_FILE_LOADED: c_int = 8;
+const MPV_END_FILE_REASON_ERROR: c_int = 4;
+const LOADFILE_REPLY_ID: u64 = 0x594c_4f41_44;
+
 #[derive(Clone, Copy)]
 struct Api {
     create: unsafe extern "C" fn() -> *mut c_void,
@@ -49,6 +82,7 @@ struct Api {
     render_render: unsafe extern "C" fn(*mut c_void, *const RenderParam) -> c_int,
     render_update: unsafe extern "C" fn(*mut c_void) -> u64,
     render_callback: unsafe extern "C" fn(*mut c_void, RenderUpdate, *mut c_void),
+    wait_event: unsafe extern "C" fn(*mut c_void, f64) -> *const MpvEvent,
 }
 
 impl Api {
@@ -68,6 +102,7 @@ impl Api {
             render_render: get(library, b"mpv_render_context_render\0")?,
             render_update: get(library, b"mpv_render_context_update\0")?,
             render_callback: get(library, b"mpv_render_context_set_update_callback\0")?,
+            wait_event: get(library, b"mpv_wait_event\0")?,
         })
     }
 }
@@ -146,6 +181,8 @@ impl Player {
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
         let player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, _lib: lib };
+        // Network HTTP media is streamed through libmpv with bounded memory,
+        // no disk cache, and no full-file download before playback.
         for (key, value) in [
             ("config", "no"),
             ("vo", "libmpv"),
@@ -153,7 +190,7 @@ impl Player {
             ("keep-open", "yes"),
             ("osc", "no"),
             ("hwdec", "auto-safe"),
-        ] {
+        ].into_iter().chain(NETWORK_STREAM_OPTIONS.iter().copied()) {
             let key = CString::new(key).unwrap();
             let value = CString::new(value).unwrap();
             let status = unsafe { (player.api.set_option_string)(player.handle, key.as_ptr(), value.as_ptr()) };
@@ -181,7 +218,7 @@ impl Player {
         self.wake = Some(wake);
         if !self.loaded {
             if let Some(clip) = clip {
-                self.send_strings(&["loadfile".into(), clip.to_string_lossy().into_owned(), "replace".into()])?;
+                self.send_loadfile(clip.to_string_lossy().as_ref())?;
                 self.loaded = true;
             }
         }
@@ -199,18 +236,55 @@ impl Player {
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return Err("Extractor returned a non-HTTP streaming URL".into());
         }
-        self.send_strings(&["loadfile".into(), url.into(), "replace".into()])?;
+        self.send_loadfile(url)?;
         self.loaded = true;
         Ok(())
     }
 
     pub fn send_strings(&self, args: &[String]) -> Result<(), String> {
+        self.send_command(args, 0)
+    }
+
+    fn send_loadfile(&self, target: &str) -> Result<(), String> {
+        self.send_command(&["loadfile".into(), target.into(), "replace".into()], LOADFILE_REPLY_ID)
+    }
+
+    fn send_command(&self, args: &[String], reply: u64) -> Result<(), String> {
         let strings: Vec<_> = args.iter().map(|s| CString::new(s.as_str())
             .map_err(|_| "Command contains an embedded NUL".to_string())).collect::<Result<_, _>>()?;
         let mut pointers: Vec<*const c_char> = strings.iter().map(|s| s.as_ptr()).collect();
         pointers.push(ptr::null());
-        let status = unsafe { (self.api.command_async)(self.handle, 0, pointers.as_ptr()) };
+        let status = unsafe { (self.api.command_async)(self.handle, reply, pointers.as_ptr()) };
         if status < 0 { Err(format!("mpv_command_async rejected command: {status}")) } else { Ok(()) }
+    }
+
+    /// Nonblocking mpv event processing. Never include event payload filenames
+    /// or streaming URLs in diagnostics; only expose numeric error codes.
+    pub fn poll_events(&self) -> Vec<PlaybackEvent> {
+        let mut events = Vec::new();
+        for _ in 0..64 {
+            let ptr = unsafe { (self.api.wait_event)(self.handle, 0.0) };
+            if ptr.is_null() { break; }
+            let event = unsafe { &*ptr };
+            if event.event_id == MPV_EVENT_NONE { break; }
+            match event.event_id {
+                MPV_EVENT_START_FILE => events.push(PlaybackEvent::StartFile),
+                MPV_EVENT_FILE_LOADED => events.push(PlaybackEvent::FileLoaded),
+                MPV_EVENT_COMMAND_REPLY if event.reply_userdata == LOADFILE_REPLY_ID && event.error < 0 => {
+                    events.push(PlaybackEvent::LoadFailed(event.error));
+                }
+                MPV_EVENT_END_FILE if !event.data.is_null() => {
+                    let end = unsafe { &*event.data.cast::<MpvEndFile>() };
+                    if end.reason == MPV_END_FILE_REASON_ERROR {
+                        events.push(PlaybackEvent::LoadFailed(end.error));
+                    } else if end.reason == 0 {
+                        events.push(PlaybackEvent::Ended);
+                    }
+                }
+                _ => {}
+            }
+        }
+        events
     }
 
     pub fn property_double(&self, name: &CStr) -> Option<f64> {
