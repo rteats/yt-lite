@@ -60,3 +60,42 @@ fn canonical_url_rejects_untrusted_hosts_and_missing_ids() {
     assert_eq!(canonical_video_url("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ").unwrap_err().code, "invalid_video_id");
     assert_eq!(canonical_video_url("file:///etc/passwd").unwrap_err().code, "invalid_url");
 }
+
+
+#[test]
+fn ignores_storyboard_formats_that_do_not_contain_playable_media() {
+    // yt-dlp may include storyboard/image formats in its formats array.
+    let payload = r#"{
+        "id":"dQw4w9WgXcQ", "title":"Public sample",
+        "formats":[
+            {"format_id":"sb0","url":"https://example.test/storyboard.jpg",
+             "vcodec":"none","acodec":"none"},
+            {"format_id":"18","url":"https://example.test/muxed",
+             "vcodec":"avc1","acodec":"mp4a"},
+            {"format_id":"140","url":"https://example.test/audio",
+             "vcodec":"none","acodec":"mp4a"}
+        ]
+    }"#;
+    let result = parse_provider_json(Provider::YtDlp, ID, payload).unwrap();
+    match result.streams {
+        Capability::Available(formats) => {
+            assert_eq!(formats.len(), 2);
+            assert_eq!(formats[0].format_id, "18");
+            assert_eq!(formats[1].format_id, "140");
+        },
+        _ => panic!("expected two media streams without the storyboard"),
+    }
+}
+
+#[test]
+fn storyboard_only_response_has_no_playable_streams() {
+    let payload = r#"{
+        "id":"dQw4w9WgXcQ", "title":"Public sample",
+        "formats":[
+            {"format_id":"sb0","url":"https://example.test/storyboard.jpg",
+             "vcodec":"none","acodec":"none"}
+        ]
+    }"#;
+    let result = parse_provider_json(Provider::YtDlp, ID, payload).unwrap();
+    assert_eq!(result.streams, Capability::Unavailable);
+}
