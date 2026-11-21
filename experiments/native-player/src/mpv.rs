@@ -6,7 +6,7 @@
 
 use crate::PlayerWindow;
 use libloading::Library;
-use slint::Weak;
+use slint::{ComponentHandle, Weak};
 use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
     path::Path,
@@ -136,7 +136,7 @@ impl Player {
         let api = unsafe { Api::load(&lib)? };
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
-        let mut player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, _lib: lib };
+        let player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, _lib: lib };
         for (key, value) in [
             ("config", "no"),
             ("vo", "libmpv"),
