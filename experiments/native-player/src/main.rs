@@ -11,7 +11,7 @@ use yt_lite_extraction_proof::{canonical_video_url, extract, HttpPlaybackHeaders
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
-    import { Button, HorizontalBox, VerticalBox, LineEdit } from "std-widgets.slint";
+    import { Button, HorizontalBox, VerticalBox, LineEdit, Palette } from "std-widgets.slint";
 
     export component PlayerWindow inherits Window {
         title: "yt-lite / watch";
@@ -27,7 +27,7 @@ slint::slint! {
         in-out property <string> url-text: "";
         in-out property <bool> has-url: false;
         in-out property <bool> has-media: false;
-        in-out property <bool> dark-mode: true;
+        in-out property <bool> dark-mode: Palette.color-scheme == ColorScheme.dark;
         callback open-url(string);
         callback open-browser();
         callback toggle-pause();
@@ -69,7 +69,7 @@ slint::slint! {
                 }
                 Button {
                     text: root.dark-mode ? "Light" : "Dark";
-                    clicked => { root.dark-mode = !root.dark-mode; }
+                    clicked => { Palette.color-scheme = root.dark-mode ? ColorScheme.light : ColorScheme.dark; }
                 }
             }
         }
