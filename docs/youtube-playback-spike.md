@@ -108,8 +108,38 @@ error appears, share only the **sanitized** PowerShell lines starting
 `[yt-lite]` and the non-URL UI status; do not share signed stream URLs,
 raw extractor JSON or full mpv network logs.
 
+## Successful Windows streaming playback — 2026-11-21
+
+User-verified after rebuilding commit `8f143bb9` on Windows 10:
+
+- `cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets`: all 7 integration/action tests passed, with no test failures
+- `cargo build --release --manifest-path experiments/native-player/Cargo.toml`: succeeded
+- `--provider yt-dlp`: the native Slint/libmpv window played the public YouTube URL **with audible sound**, advancing progress and working seeks; the user reported playback worked well
+- The console reported `loading yt-dlp network stream (incremental HTTP)` followed by `yt-dlp media loaded; streaming`
+- `--provider auto`: Rust was initially selected, but libmpv returned `mpv media load failed (code -13)`; the fallback switched to yt-dlp and logged `yt-dlp media loaded; streaming`
+- Neither the Rust stream's **playability** nor the playback URL's validity is guaranteed by `rusty_ytdl` metadata alone, even when a format is reported as muxed
+
+**Conclusion:** End-to-end extraction, incremental streaming, native decoding,
+audible sound, progress, and seeking have now been demonstrated on one public
+YouTube watch URL **using yt-dlp**. Automatic fallback was observed reaching
+`FILE_LOADED` with yt-dlp after the Rust load failed. The user's explicit
+confirmation of audio/progress/seeking applies to the direct yt-dlp run; do
+not silently equate the auto fallback's `FILE_LOADED` event with a complete
+second audiovisual check.
+
+This is a successful **integration feasibility proof**, not completion of
+the watch-shell or general YouTube client. Representative video classes,
+actual per-track high-resolution playback, seek/rebuffer behavior, network
+interruptions, quality selection, stream URL refresh, and clean packaging
+are still outstanding.
+
+The streaming cache remains bounded in RAM and yt-dlp's invocation
+does not download media to disk. A network trace was not captured, so
+the observed proof confirms playback behavior and implementation design,
+not a measured byte-level buffer profile.
+
 ## Known limitations and decision gate
 
 The public video in the extraction feasibility test provided one muxed Rust stream and 43 yt-dlp media formats, so this spike deliberately exercises Rust-first playback and avoids the immediate complexity of joining separate audio/video tracks. The currently chosen muxed format might be lower-resolution or require request headers not present in the extraction adapter. If video stays black, spins, plays silently or returns an HTTP error, report the symptom and any *redacted* diagnostics; don't claim the network playback proof succeeded.
 
-The Slint/native proof has been validated with **local** MP4; this branch has **not** yet been validated playing a live YouTube stream. Issues #5 and #6 remain the authoritative shell and full URL-playback milestones.
+The Slint/native proof was validated with **local** MP4, and this integration branch is now validated streaming one public YouTube watch video with **yt-dlp**, including audible sound, progress and seeking. The Rust-selected URL failed with mpv code -13; automatic fallback reached yt-dlp `FILE_LOADED`. Issues #5 and #6 remain the authoritative shell and complete URL-playback milestones.
