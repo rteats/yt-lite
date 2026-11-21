@@ -108,9 +108,43 @@ guide; Deno setup is documented in the official Deno installation guide.
 If `Get-Command yt-dlp` fails, use the *actual installed* `yt-dlp.exe`
 path in `--yt-dlp`. Never assume `C:\tools\yt-dlp.exe` exists.
 
+## Second Windows live probe — 2026-11-21
+
+The user rebuilt the fixed parser with `cargo build --release` (passed) and
+tested the same public watch URL with both extractors. Local versions:
+`yt-dlp 2026.10.26` and `deno 2.9.8`.
+
+| Provider | Duration | Raw reported formats | Video-containing | Audio-only | Captions | Chapters |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| `rust` | 213 s | 1 | 1 | 0 | unknown | unavailable |
+| `yt-dlp` | 213 s | 49 | 38 | 5 | available: 1,139 entries (1,104 automatic) | unknown |
+| `auto` | 213 s | 1 | 1 | 0 | unknown | unavailable |
+
+The remaining 6 yt-dlp entries had neither audio nor video according to
+the parser. Such entries can represent storyboard/thumbnail formats, not
+usable streams. A new offline regression test and parsing filter exclude
+entries where both `has_video` and `has_audio` are false; the updated
+summary will therefore likely report fewer than 49 *selectable* streams.
+This revised count has **not** been retested on Windows yet.
+
+The Rust result has one video-containing format, but the old summary does
+not distinguish a combined audio+video stream from a silent video-only
+stream. The CLI now reports `muxed_streams` and `video_only_streams`
+separately (also not yet retested in this Windows session). A zero
+audio-only count **does not prove missing audio**.
+
+`auto` selected Rust because its current routing policy accepts any
+nonempty media-format list. This test does not establish audio decoding,
+stream URL validity, or multi-provider fallback. Record those separately;
+capability-level merging and URL-expiry recovery remain issue #22.
+
+The 1,139 caption entries are raw selectable track/format entries, **not
+1,139 languages**. Distinct-language grouping and user selection belong
+to the future subtitle controls.
+
 ## Dependencies and provenance
 
-- `rusty_ytdl` 0.7.4 is MIT OR Apache-2.0 per docs.rs. Its real extraction compatibility is **unverified**.
+- `rusty_ytdl` 0.7.4 is MIT OR Apache-2.0 per docs.rs. The user's public-video probe successfully returned metadata and one stream, but playback URL validity and general compatibility are still unverified.
 - `yt-dlp` source is Unlicense, but its official PyInstaller Windows executable bundles additional dependencies and the **combined executable is GPLv3+** under its own release documentation. Audit this distinction, the EJS components, and any Deno/libmpv redistribution with the final application's AGPL obligations before packaging (issue #4). The harness neither downloads nor bundles them.
 - YouTube's current challenge-solving path requires [yt-dlp-ejs](https://github.com/yt-dlp/ejs) and a supported JavaScript runtime. According to the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS), the official Windows `yt-dlp.exe` already embeds EJS scripts, while Deno (recommended, enabled by default) must be present separately on `PATH` or next to `yt-dlp.exe`. The referenced guide lists Deno minimum 2.3.0. Check `deno --version` during live validation; a missing runtime can mean incomplete stream availability even if metadata succeeds. Neither the harness nor yt-dlp's standalone executable bundles Deno here. Any future standalone release must decide how to bundle a compatible runtime and comply with its licenses (issue #4).
 - All harness source code was written for yt-lite. The fixtures are synthetic.
@@ -120,5 +154,5 @@ path in `--yt-dlp`. Never assume `C:\tools\yt-dlp.exe` exists.
 
 - The Rust route cannot currently expose captions; it returns `unknown`.
 - `auto` handles extraction failure/missing streams, not per-capability recovery or expired URLs (issue #22).
-- Offline Windows/Linux Cargo checks passed in GitHub Actions. Live extraction, signed-URL validity, and playback integration have not been verified.
+- Offline Windows/Linux Cargo checks passed in GitHub Actions. One public-video live extraction has succeeded with both providers on Windows; signed-URL validity, playback integration, and other video types remain unverified.
 - The Slint/libmpv playback proof is issue #2, outside this harness.
