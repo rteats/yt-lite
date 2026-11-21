@@ -26,6 +26,7 @@ slint::slint! {
         in-out property <string> status: "Paste a YouTube URL above to begin."; 
         in-out property <string> url-text: "";
         in-out property <bool> has-url: false;
+        in-out property <bool> has-media: false;
         in-out property <bool> dark-mode: true;
         callback open-url(string);
         callback open-browser();
@@ -113,14 +114,17 @@ slint::slint! {
                 HorizontalBox {
                     spacing: 10px;
                     Button {
+                        enabled: root.has-media;
                         text: root.paused ? "Play" : "Pause";
                         clicked => { root.toggle-pause(); }
                     }
                     Button {
+                        enabled: root.has-media;
                         text: "-10 s";
                         clicked => { root.seek-by(-10); }
                     }
                     Button {
+                        enabled: root.has-media;
                         text: "+10 s";
                         clicked => { root.seek-by(10); }
                     }
@@ -230,6 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .renderer_name("femtovg".into()).require_opengl().select()?;
     let window = PlayerWindow::new()?;
     window.set_has_url(remote_url.is_some());
+    window.set_has_media(clip.is_some());
     if let Some(ref url) = remote_url {
         window.set_url_text(url.as_str().into());
     }
@@ -357,6 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     has_network_media = false;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_url(true);
+                        ui.set_has_media(false);
                         ui.set_url_text(canonical.into());
                         ui.set_fraction(0.0);
                     }
@@ -376,6 +382,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // This may also fire when retrying; do not interpret as playback.
                 }
                 PlaybackEvent::FileLoaded => {
+                    if let Some(ui) = label_window.upgrade() {
+                        ui.set_has_media(true);
+                    }
                     if load_started.is_some() {
                         load_started = None;
                         file_loaded = true;
@@ -470,6 +479,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file_loaded_at = None;
                     playback_advanced = false;
                     has_network_media = false;
+                    if let Some(ui) = label_window.upgrade() {
+                        ui.set_has_media(false);
+                    }
                 } else {
                     playback_error = Some(err);
                 }
