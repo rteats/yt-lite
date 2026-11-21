@@ -8,7 +8,7 @@ use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract, HttpPlaybackHeaders, Provider};
-use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, select_muxed_stream, PlaybackAction};
+use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox, LineEdit } from "std-widgets.slint";
@@ -191,9 +191,9 @@ fn provider_label(provider: Provider) -> &'static str {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let input = args.next().ok_or(
-        "Usage: yt-lite-native-player-proof <local-video-file | YouTube-video-URL> [--provider auto|rust|yt-dlp] [--yt-dlp PATH]"
-    )?;
+    // Launch into an idle native watch shell when no source is supplied.
+    // URLs can be entered through the native LineEdit after startup.
+    let input = args.next().unwrap_or_default();
     let mut helper = PathBuf::from("yt-dlp");
     let mut requested_provider = Provider::Auto;
     while let Some(flag) = args.next() {
@@ -209,7 +209,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(format!("Unknown option: {flag}").into()),
         }
     }
-    let (clip, remote_url) = if input.starts_with("https://") || input.starts_with("http://") {
+    let (clip, remote_url) = if input.is_empty() {
+        (None, None)
+    } else if input.starts_with("https://") || input.starts_with("http://") {
         let (_, canonical) = canonical_video_url(&input)
             .map_err(|error| format!("{} {}", error.message, error.action))?;
         (None, Some(canonical))
@@ -218,12 +220,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
-    let initial_provider = if requested_provider == Provider::Auto { Provider::Rust } else { requested_provider };
+    let initial_provider = preferred_playback_provider(requested_provider);
     let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
     let window = PlayerWindow::new()?;
+    window.set_has_url(remote_url.is_some());
+    if let Some(ref url) = remote_url {
+        window.set_url_text(url.as_str().into());
+    }
+
+    // UI callbacks only enqueue a request. The timer handles validation,
+    // cancellation and lifecycle; no synchronous network IO runs in Slint.
+    let requested_url = Rc::new(RefCell::new(None::<String>));
+    let new_request = requested_url.clone();
+    window.on_open_url(move |input| {
+        *new_request.borrow_mut() = Some(input.to_string());
+    });
+
+    // Browser fallback gets only a canonicalized URL; never a signed media
+    // URL, arbitrary URI scheme or extractor response.
+    let browser_url = Rc::new(RefCell::new(remote_url.clone()));
+    let external_url = browser_url.clone();
+    window.on_open_browser(move || {
+        if let Some(url) = external_url.borrow().clone() {
+            std::thread::spawn(move || {
+                if webbrowser::open(&url).is_err() {
+                    eprintln!("[yt-lite] Could not open the system browser");
+                }
+            });
+        }
+    });
+
+    let clip_source = Rc::new(RefCell::new(clip));
     let player = Rc::new(RefCell::new(Player::open()?));
 
     let controls = player.clone();
@@ -266,11 +296,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let video_window = window.as_weak();
     let video_session = player.clone();
+    let rendering_clip = clip_source.clone();
     window.window().set_rendering_notifier(move |phase, api| {
         if !matches!(api, GraphicsAPI::NativeOpenGL { .. }) { return; }
         match phase {
             RenderingState::RenderingSetup => {
-                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), clip.as_deref()) {
+                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), rendering_clip.borrow().as_deref()) {
                     eprintln!("Video initialization error: {error}");
                 }
             }
@@ -288,6 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label_window = window.as_weak();
     let label_player = player.clone();
     let mut receiver = remote_receiver;
+    let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
     let mut resolving = receiver.is_some();
     let mut media_title: Option<String> = None;
@@ -300,6 +332,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut has_network_media = false;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        // A new watch URL replaces the current playback session but does not
+        // construct a new libmpv core. In-flight extraction results are dropped.
+        if let Some(input) = requested_url.borrow_mut().take() {
+            match canonical_video_url(input.trim()) {
+                Ok((_, canonical)) => {
+                    let _ = label_player.borrow().send_strings(&["stop".into()]);
+                    active_provider = preferred_playback_provider(requested_provider);
+                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider));
+                    pending = None;
+                    resolving = true;
+                    remote_url = Some(canonical.clone());
+                    *browser_url.borrow_mut() = Some(canonical.clone());
+                    clip_source.borrow_mut().take();
+                    media_title = None;
+                    playback_error = None;
+                    load_started = None;
+                    file_loaded = false;
+                    file_loaded_at = None;
+                    playback_advanced = false;
+                    has_network_media = false;
+                    if let Some(ui) = label_window.upgrade() {
+                        ui.set_has_url(true);
+                        ui.set_url_text(canonical.into());
+                        ui.set_fraction(0.0);
+                    }
+                }
+                Err(error) => {
+                    playback_error = Some(format!("{} {}", error.message, error.action));
+                }
+            }
+        }
         let mut failure: Option<String> = None;
 
         // Unlike the earlier prototype, consume the mpv event queue. An
@@ -417,6 +480,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(ui) = label_window.upgrade() {
+            if remote_url.is_none() && clip_source.borrow().is_none() {
+                ui.set_status("Paste a YouTube URL above and press Enter.".into());
+                ui.set_fraction(0.0);
+                return;
+            }
             if let Some(ref err) = playback_error {
                 ui.set_status(format!("Playback failed: {err}").into());
                 return;
