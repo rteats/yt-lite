@@ -122,6 +122,7 @@ pub struct Player {
     handle: *mut c_void,
     context: *mut c_void,
     wake: Option<Box<Wake>>,
+    loaded: bool,
     _lib: Library,
 }
 
@@ -135,7 +136,7 @@ impl Player {
         let api = unsafe { Api::load(&lib)? };
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
-        let mut player = Self { api, handle, context: ptr::null_mut(), wake: None, _lib: lib };
+        let mut player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, _lib: lib };
         for (key, value) in [
             ("config", "no"),
             ("vo", "libmpv"),
@@ -169,7 +170,10 @@ impl Player {
         let wake = Box::new(Wake { window: Mutex::new(ui), queued: Arc::new(AtomicBool::new(false)) });
         unsafe { (self.api.render_callback)(ctx, Some(redraw_callback), (&*wake as *const Wake).cast_mut().cast()) };
         self.wake = Some(wake);
-        self.send_strings(&["loadfile".into(), clip.to_string_lossy().into_owned(), "replace".into()])?;
+        if !self.loaded {
+            self.send_strings(&["loadfile".into(), clip.to_string_lossy().into_owned(), "replace".into()])?;
+            self.loaded = true;
+        }
         Ok(())
     }
 
