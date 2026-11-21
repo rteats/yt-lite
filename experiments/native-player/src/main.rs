@@ -346,6 +346,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match canonical_video_url(input.trim()) {
                 Ok((_, canonical)) => {
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
+                    // An explicit user Open action should start the new video
+                    // even if the previous video was left paused.
+                    let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
                     active_provider = preferred_playback_provider(requested_provider);
                     receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider));
                     pending = None;
