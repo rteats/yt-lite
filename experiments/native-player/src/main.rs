@@ -190,14 +190,14 @@ fn provider_label(provider: Provider) -> &'static str {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Flags work with or without a startup video; users can paste the URL
+    // later in the watch bar. Reject ambiguous multiple media sources.
     let mut args = std::env::args().skip(1);
-    // Launch into an idle native watch shell when no source is supplied.
-    // URLs can be entered through the native LineEdit after startup.
-    let input = args.next().unwrap_or_default();
+    let mut source: Option<String> = None;
     let mut helper = PathBuf::from("yt-dlp");
     let mut requested_provider = Provider::Auto;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--yt-dlp" => {
                 helper = PathBuf::from(args.next().ok_or("Missing --yt-dlp PATH")?);
             }
@@ -206,9 +206,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 requested_provider = Provider::parse(&selection)
                     .ok_or("Provider must be auto, rust or yt-dlp")?;
             }
-            _ => return Err(format!("Unknown option: {flag}").into()),
+            _ if arg.starts_with("--") => return Err(format!("Unknown option: {arg}").into()),
+            _ if source.is_none() => source = Some(arg),
+            _ => return Err("Only one media source may be supplied".into()),
         }
     }
+    let input = source.unwrap_or_default();
     let (clip, remote_url) = if input.is_empty() {
         (None, None)
     } else if input.starts_with("https://") || input.starts_with("http://") {
@@ -480,13 +483,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(ui) = label_window.upgrade() {
+            if let Some(ref err) = playback_error {
+                ui.set_status(format!("Open failed: {err}").into());
+                return;
+            }
             if remote_url.is_none() && clip_source.borrow().is_none() {
                 ui.set_status("Paste a YouTube URL above and press Enter.".into());
                 ui.set_fraction(0.0);
-                return;
-            }
-            if let Some(ref err) = playback_error {
-                ui.set_status(format!("Playback failed: {err}").into());
                 return;
             }
             if resolving {
