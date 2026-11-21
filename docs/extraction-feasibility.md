@@ -37,6 +37,7 @@ cargo build --release
 .\target\release\yt-lite-extraction-proof.exe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider yt-dlp --yt-dlp "C:\tools\yt-dlp.exe"
 .\target\release\yt-lite-extraction-proof.exe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider auto --yt-dlp "C:\tools\yt-dlp.exe"
 & "C:\tools\yt-dlp.exe" --version
+deno --version
 ```
 
 Replace the sample URL with each of the four representative cases listed above;
@@ -64,6 +65,7 @@ Do not post `--raw-json` output: it contains signed stream/caption URLs.
 
 - `rusty_ytdl` 0.7.4 is MIT OR Apache-2.0 per docs.rs. Its real extraction compatibility is **unverified**.
 - `yt-dlp` is distributed under the Unlicense; recheck the official license and current release before packaging. The harness expects a separately supplied binary, performs no automatic download, and captures only provider JSON.
+- YouTube's current challenge-solving path requires [yt-dlp-ejs](https://github.com/yt-dlp/ejs) and a supported JavaScript runtime. According to the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS), the official Windows `yt-dlp.exe` already embeds EJS scripts, while Deno (recommended, enabled by default) must be present separately on `PATH` or next to `yt-dlp.exe`. The referenced guide lists Deno minimum 2.3.0. Check `deno --version` during live validation; a missing runtime can mean incomplete stream availability even if metadata succeeds. Neither the harness nor yt-dlp's standalone executable bundles Deno here. Any future standalone release must decide how to bundle a compatible runtime and comply with its licenses (issue #4).
 - All harness source code was written for yt-lite. The fixtures are synthetic.
 - Final AGPLv3 licensing and binary redistribution obligations are separate issue #4.
 
