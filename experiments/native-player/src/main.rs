@@ -150,6 +150,7 @@ struct ResolvedStream {
     title: String,
     provider: Provider,
     headers: HttpPlaybackHeaders,
+    extraction_ms: u128,
 }
 
 type StreamResolution = Result<ResolvedStream, String>;
@@ -159,6 +160,7 @@ type StreamResolution = Result<ResolvedStream, String>;
 fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> Receiver<StreamResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
+        let extraction_started = Instant::now();
         let result = (|| -> StreamResolution {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -177,6 +179,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> R
                     title: info.title,
                     provider,
                     headers,
+                    extraction_ms: extraction_started.elapsed().as_millis(),
                 })
             })
         })();
@@ -200,8 +203,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source: Option<String> = None;
     let mut helper = PathBuf::from("yt-dlp");
     let mut requested_provider = Provider::Auto;
+    let mut profile_timings = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--timings" => profile_timings = true,
             "--yt-dlp" => {
                 helper = PathBuf::from(args.next().ok_or("Missing --yt-dlp PATH")?);
             }
@@ -264,6 +269,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clip_source = Rc::new(RefCell::new(clip));
     let player = Rc::new(RefCell::new(Player::open()?));
 
+    let seek_started = Rc::new(RefCell::new(None::<Instant>));
+
     let controls = player.clone();
     window.on_toggle_pause(move || {
         if let Some(command) = command_for(PlaybackAction::TogglePause) {
@@ -274,22 +281,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let controls = player.clone();
+    let relative_seek_started = seek_started.clone();
     window.on_seek_by(move |seconds| {
         if let Some(command) = command_for(PlaybackAction::SeekRelative(seconds.into())) {
-            if let Err(error) = controls.borrow().send_strings(&command) {
-                eprintln!("Seek error: {error}");
+            match controls.borrow().send_strings(&command) {
+                Ok(()) if profile_timings => *relative_seek_started.borrow_mut() = Some(Instant::now()),
+                Err(error) => eprintln!("Seek error: {error}"),
+                _ => {}
             }
         }
     });
 
     let controls = player.clone();
+    let absolute_seek_started = seek_started.clone();
     window.on_seek_to(move |fraction| {
         let duration = controls.borrow().property_double(c"duration").unwrap_or(0.0);
         if let Some(command) = command_for(PlaybackAction::SeekFraction {
             fraction: f64::from(fraction), duration_seconds: duration,
         }) {
-            if let Err(error) = controls.borrow().send_strings(&command) {
-                eprintln!("Scrub error: {error}");
+            match controls.borrow().send_strings(&command) {
+                Ok(()) if profile_timings => *absolute_seek_started.borrow_mut() = Some(Instant::now()),
+                Err(error) => eprintln!("Scrub error: {error}"),
+                _ => {}
             }
         }
     });
@@ -326,6 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let label_window = window.as_weak();
     let label_player = player.clone();
+    let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
     let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
@@ -346,6 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match canonical_video_url(input.trim()) {
                 Ok((_, canonical)) => {
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
+                    *pending_seek_timing.borrow_mut() = None;
                     // An explicit user Open action should start the new video
                     // even if the previous video was left paused.
                     let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
@@ -384,14 +399,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PlaybackEvent::StartFile => {
                     // This may also fire when retrying; do not interpret as playback.
                 }
+                PlaybackEvent::PlaybackRestart => {
+                    if profile_timings {
+                        if let Some(start) = pending_seek_timing.borrow_mut().take() {
+                            eprintln!("[yt-lite] timing seek-to-playback-restart={}ms", start.elapsed().as_millis());
+                        }
+                    }
+                }
                 PlaybackEvent::FileLoaded => {
                     if (remote_url.is_none() || load_started.is_some()) && label_window.upgrade().is_some() {
                         if let Some(ui) = label_window.upgrade() {
                             ui.set_has_media(true);
                         }
                     }
-                    if load_started.is_some() {
-                        load_started = None;
+                    if let Some(start) = load_started.take() {
+                        if profile_timings {
+                            eprintln!("[yt-lite] timing libmpv-load={}ms", start.elapsed().as_millis());
+                        }
                         file_loaded = true;
                         file_loaded_at = Some(Instant::now());
                         eprintln!("[yt-lite] {} media loaded; streaming", provider_label(active_provider));
@@ -449,6 +473,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match response {
                     Ok(stream) => {
                         active_provider = stream.provider;
+                        if profile_timings {
+                            eprintln!("[yt-lite] timing {}-extract={}ms", provider_label(stream.provider), stream.extraction_ms);
+                        }
                         media_title = Some(stream.title);
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
                         match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
