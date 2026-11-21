@@ -13,6 +13,8 @@ cargo run -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider yt-dlp --y
 cargo run -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider auto
 ```
 
+**Current yt-dlp dependency:** For full YouTube support, yt-dlp needs a JavaScript runtime to solve YouTube challenges. Its [official EJS guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS) recommends Deno (minimum 2.3.0 in the referenced guide), enabled by default. The official Windows `yt-dlp.exe` bundles the required EJS scripts, **but not Deno**. Put `deno.exe` on `PATH` or beside `yt-dlp.exe`, then check `deno --version`. Because the harness passes `--ignore-config`, it cannot rely on user yt-dlp configuration to enable nondefault JS runtimes. A self-contained bundled runtime is tracked by issue #4.
+
 The default output is a **privacy-safe JSON capability summary** containing provider, duration, stream counts, captions and chapters. It intentionally excludes video IDs, stream/caption URLs, thumbnails and channel/title metadata. Each capability distinguishes `available`, `unavailable` and `unknown`. `unknown` means not reported, not necessarily absent.
 
 `--provider auto` (default) falls back to yt-dlp when the Rust extraction route fails or returns no streams. Supply `--yt-dlp PATH` if the helper is not on `PATH`.
