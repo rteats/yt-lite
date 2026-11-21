@@ -61,10 +61,57 @@ found without a manual install. Success requires **real nonempty playable stream
 URLs** (check privately via `--raw-json` only when needed), not just metadata.
 Do not post `--raw-json` output: it contains signed stream/caption URLs.
 
+## First Windows PowerShell live result — 2026-11-21
+
+A user ran the release build against a public watch URL. The build completed.
+The original Rust probe returned one stream and marked captions unknown,
+chapters unavailable, and duration null. The yt-dlp probe returned
+`helper_missing` because the documentation's example path
+`C:\tools\yt-dlp.exe` did not exist. `auto` used the Rust result because
+it had a nonempty stream list; **yt-dlp fallback was not exercised**.
+
+**Root cause confirmed for a subset of the results:** `rusty_ytdl` 0.7.4
+uses `lengthSeconds`, `ownerChannelName`, `hasVideo`, and `hasAudio`
+in its serialized schema, whereas the prototype parser expected different
+keys. This caused duration to be dropped and stream audio/video flags
+potentially misclassified. The fix is covered by
+`tests/rust_provider_schema.rs` and its fixture based on the upstream
+published structs. The user's first live summary predates this fix;
+its stream classification and missing duration are **not valid evidence**
+of limitations in the Rust upstream extractor.
+
+Next: rebuild and repeat the Rust probe. Then install the helper and Deno,
+run both extraction routes with real URLs, compare audio/video flags and
+confirm the stream URL can actually be played. No raw signed URL data was
+included in the supplied test log.
+
+### Windows helper setup (rather than the illustrative C:\tools path)
+
+```powershell
+winget install --source winget --id yt-dlp.yt-dlp
+winget install DenoLand.Deno
+# Open a NEW PowerShell window so PATH changes take effect:
+Get-Command yt-dlp, deno
+yt-dlp --version
+deno --version
+# From the yt-lite repository root after rebuilding:
+cargo build --release
+$exe = ".\target\release\yt-lite-extraction-proof.exe"
+$url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+& $exe $url --provider rust
+& $exe $url --provider yt-dlp --yt-dlp yt-dlp
+& $exe $url --provider auto --yt-dlp yt-dlp
+```
+
+The `winget` command is documented by the official yt-dlp installation
+guide; Deno setup is documented in the official Deno installation guide.
+If `Get-Command yt-dlp` fails, use the *actual installed* `yt-dlp.exe`
+path in `--yt-dlp`. Never assume `C:\tools\yt-dlp.exe` exists.
+
 ## Dependencies and provenance
 
 - `rusty_ytdl` 0.7.4 is MIT OR Apache-2.0 per docs.rs. Its real extraction compatibility is **unverified**.
-- `yt-dlp` is distributed under the Unlicense; recheck the official license and current release before packaging. The harness expects a separately supplied binary, performs no automatic download, and captures only provider JSON.
+- `yt-dlp` source is Unlicense, but its official PyInstaller Windows executable bundles additional dependencies and the **combined executable is GPLv3+** under its own release documentation. Audit this distinction, the EJS components, and any Deno/libmpv redistribution with the final application's AGPL obligations before packaging (issue #4). The harness neither downloads nor bundles them.
 - YouTube's current challenge-solving path requires [yt-dlp-ejs](https://github.com/yt-dlp/ejs) and a supported JavaScript runtime. According to the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS), the official Windows `yt-dlp.exe` already embeds EJS scripts, while Deno (recommended, enabled by default) must be present separately on `PATH` or next to `yt-dlp.exe`. The referenced guide lists Deno minimum 2.3.0. Check `deno --version` during live validation; a missing runtime can mean incomplete stream availability even if metadata succeeds. Neither the harness nor yt-dlp's standalone executable bundles Deno here. Any future standalone release must decide how to bundle a compatible runtime and comply with its licenses (issue #4).
 - All harness source code was written for yt-lite. The fixtures are synthetic.
 - Final AGPLv3 licensing and binary redistribution obligations are separate issue #4.
