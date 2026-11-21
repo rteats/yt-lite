@@ -14,6 +14,8 @@ fn summarizes_yt_dlp_capabilities_without_exposing_provider_details() {
     assert_eq!(summary.streams.status, CapabilityStatus::Available);
     assert_eq!(summary.streams.count, 2);
     assert_eq!(summary.video_streams, 1);
+    assert_eq!(summary.video_only_streams, 0);
+    assert_eq!(summary.muxed_streams, 1);
     assert_eq!(summary.audio_only_streams, 1);
     assert_eq!(summary.captions.status, CapabilityStatus::Available);
     assert_eq!(summary.captions.count, 2);
@@ -36,6 +38,8 @@ fn summary_preserves_unknown_separately_from_explicitly_unavailable() {
         Provider::Rust, ID, include_str!("fixtures/rust-video.json")
     ).unwrap();
     let rust_summary = summarize_extraction(&rust);
+    assert_eq!(rust_summary.muxed_streams, 1);
+    assert_eq!(rust_summary.video_only_streams, 0);
     assert_eq!(rust_summary.captions.status, CapabilityStatus::Unknown);
     assert_eq!(rust_summary.captions.count, 0);
 
