@@ -128,11 +128,20 @@ pub struct Player {
 
 impl Player {
     pub fn open() -> Result<Self, String> {
-        // Deliberately load only an explicitly bundled DLL. Do not search PATH.
-        let dll = std::env::current_exe().map_err(|err| err.to_string())?
-            .parent().ok_or("Missing executable directory")?.join("mpv-2.dll");
-        let lib = unsafe { Library::new(&dll) }
-            .map_err(|err| format!("Missing compatible bundled {}: {err}", dll.display()))?;
+        // Accept both names used by Windows libmpv builds, without searching PATH.
+        let executable = std::env::current_exe().map_err(|err| err.to_string())?;
+        let directory = executable.parent().ok_or("Missing executable directory")?;
+        let dll = ["libmpv-2.dll", "mpv-2.dll"].into_iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| format!(
+                "libmpv not found in {}. Put the x64 libmpv-2.dll (or mpv-2.dll) from a trusted Windows mpv-dev build next to the executable.",
+                directory.display()
+            ))?;
+        let lib = unsafe { Library::new(&dll) }.map_err(|err| format!(
+            "Cannot load {}: {err}. Check that it is an x64 DLL and that its dependent DLLs are installed or provided alongside it.",
+            dll.display()
+        ))?;
         let api = unsafe { Api::load(&lib)? };
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
