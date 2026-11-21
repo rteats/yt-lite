@@ -49,7 +49,7 @@ After updating the implementation, compile again with `cargo build --release --m
 | Check | Status |
 | --- | --- |
 | Rust typecheck and action tests on Windows CI | Passed (run 44919931325); runtime unverified |
-| Native playback and compositing on Windows 10 x64 | Not yet measured |
+| Native playback and compositing on Windows (user smoke test) | Local clip plays; progress-fill alignment patch awaits visual retest |
 | Pause, seek, resize and fullscreen without player recreation | Not yet measured |
 | Hardware/software decode and frame pacing | Not yet measured |
 | Clean-system runtime DLL packaging, licenses | Separate issue #4 |
@@ -61,6 +61,20 @@ After updating the implementation, compile again with `cargo build --release --m
 - Local property polling uses synchronous mpv property reads on the UI thread. If profiling shows frame stalls, replace with mpv property observation from a separate worker thread. Do **not** set `MPV_RENDER_PARAM_ADVANCED_CONTROL` without ensuring independent renderer/core threads.
 - Future fallback candidates are a carefully verified ANGLE render path or a separate video window with Slint overlay handling; neither is implemented here.
 - Reference implementations such as Lumiere and Vayou-Slint were researched for architectural feasibility, not copied. The C API signatures are declared against mpv's ISC-licensed public headers. All third-party redistribution conditions remain open until issue #4.
+
+## User smoke-test feedback (2026-11-21)
+
+A user launched the built prototype with a local MP4 and confirmed the player works.
+The blue progress bar initially grew from the middle toward both sides rather than
+left-to-right. The fill rectangle now explicitly sets `x: 0px; y: 0px`;
+this change needs a **visual retest** on the user's Windows machine.
+A functioning local clip does not independently establish hardware decode,
+frame pacing, overlay persistence through resize, or all seek/fullscreen criteria.
+
+Visual regression check: at 0%, 25%, 50%, and 100% of clip duration,
+verify the blue region begins at the left edge and fills that fraction
+of the gray track. Verify that clicking the left and right ends still
+seeks to the corresponding time.
 
 ## Expected test record
 
