@@ -73,6 +73,81 @@ pub struct ExtractionResult {
     pub chapters: Capability<Chapter>,
 }
 
+/// Metadata-only capability report. Safe to publish: it contains no signed URLs,
+/// captions, titles, thumbnails, cookies or provider stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityStatus {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CapabilityCount {
+    pub status: CapabilityStatus,
+    pub count: usize,
+}
+
+impl<T> From<&Capability<T>> for CapabilityCount {
+    fn from(capability: &Capability<T>) -> Self {
+        match capability {
+            Capability::Available(items) => Self {
+                status: CapabilityStatus::Available,
+                count: items.len(),
+            },
+            Capability::Unavailable => Self {
+                status: CapabilityStatus::Unavailable,
+                count: 0,
+            },
+            Capability::Unknown => Self {
+                status: CapabilityStatus::Unknown,
+                count: 0,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExtractionSummary {
+    pub provider: Provider,
+    pub video_id: String,
+    pub duration_seconds: Option<u64>,
+    pub streams: CapabilityCount,
+    pub video_streams: usize,
+    pub audio_only_streams: usize,
+    pub captions: CapabilityCount,
+    pub automatic_caption_tracks: usize,
+    pub chapters: CapabilityCount,
+}
+
+/// Public reporting seam; drops sensitive provider URLs rather than redacting
+/// serialized JSON after the fact.
+pub fn summarize_extraction(result: &ExtractionResult) -> ExtractionSummary {
+    let (video_streams, audio_only_streams) = match &result.streams {
+        Capability::Available(streams) => (
+            streams.iter().filter(|stream| stream.has_video).count(),
+            streams.iter().filter(|stream| stream.has_audio && !stream.has_video).count(),
+        ),
+        _ => (0, 0),
+    };
+    let automatic_caption_tracks = match &result.captions {
+        Capability::Available(captions) => captions.iter().filter(|c| c.automatic).count(),
+        _ => 0,
+    };
+    ExtractionSummary {
+        provider: result.provider,
+        video_id: result.video_id.clone(),
+        duration_seconds: result.duration_seconds,
+        streams: (&result.streams).into(),
+        video_streams,
+        audio_only_streams,
+        captions: (&result.captions).into(),
+        automatic_caption_tracks,
+        chapters: (&result.chapters).into(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProbeError {
     pub code: String,
