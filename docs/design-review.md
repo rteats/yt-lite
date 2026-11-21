@@ -1,6 +1,6 @@
-# yt-lite — Design Review (Awaiting Sign-off)
+# yt-lite — Approved Design Review
 
-This is a synthesis of user decisions Q1–Q95, not an implementation specification or proof that proposed dependencies work. Confirm this review before converting it into a final spec and implementation tickets.
+This is the approved synthesis of user decisions Q1–Q95. Approval confirms product direction and scope, not proof that proposed dependencies work. The implementation specification and proposed dependency-ordered tickets were prepared separately; the ticket breakdown still requires review before publication as tracker issues.
 
 ## Goal and constraints
 
@@ -73,4 +73,4 @@ Use feature branches and pull requests, with CI before merging to main.
 - Validate technical feasibility, licensing and packaging via the prototype and focused primary-source research.
 - Establish measured performance budgets rather than invent numerical thresholds.
 - Translate the first-beta scope into dependency-ordered, independently testable tickets and define which optional advanced features are postponed.
-- Obtain explicit sign-off on this consolidated direction before treating the review as final.
+- Product direction approved on 2026-11-21. Review and confirm the draft ticket breakdown, then configure the issue tracker before publishing tracker issues.
