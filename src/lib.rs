@@ -249,7 +249,7 @@ pub async fn extract(url: &str, selected: Provider, helper: &Path) -> Result<Ext
         Provider::Rust => rust_extract(&canonical, &id).await,
         Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper).await,
         Provider::Auto => match rust_extract(&canonical, &id).await {
-            Ok(result) if matches!(result.streams, Capability::Available(_)) => Ok(result),
+            Ok(result) if matches!(&result.streams, Capability::Available(_)) => Ok(result),
             _ => yt_dlp_extract(&canonical, &id, helper).await,
         },
     }
