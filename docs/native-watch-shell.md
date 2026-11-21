@@ -142,7 +142,7 @@ It prints only timings and media/caption counts; no raw JSON, signed
 stream URLs or metadata are persisted.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\experiments\native-player\bench-yt-dlp.ps1 -Repetitions 2
+powershell.exe -NoProfile -File .\experiments\native-player\bench-yt-dlp.ps1 -Repetitions 2
 ```
 
 Variants:
