@@ -213,6 +213,9 @@ fn formats(root: &Value) -> Capability<Stream> {
         let has_audio = at(v, &["hasAudio", "has_audio"]).as_bool()
             .unwrap_or_else(|| v.get("acodec").and_then(Value::as_str).map(|c| c != "none")
                 .unwrap_or(false));
+        // yt-dlp includes storyboard/image formats under "formats". Those
+        // must not be advertised as selectable audio/video streams.
+        if !has_video && !has_audio { return None; }
         Some(Stream { format_id, url, width: integer(&v["width"]), height: integer(&v["height"]),
             fps: number(&v["fps"]), has_video, has_audio })
     }).collect::<Vec<_>>();
