@@ -42,9 +42,12 @@ fn no_combined_audio_video_stream_means_no_single_stream_playback() {
 
 #[test]
 fn automatic_playback_falls_back_once_after_primary_load_failure() {
-    use yt_lite_native_player_proof::fallback_after_playback_error;
-    assert_eq!(fallback_after_playback_error(Provider::Rust, Provider::Auto), Some(Provider::YtDlp));
-    assert_eq!(fallback_after_playback_error(Provider::YtDlp, Provider::Auto), None);
+    use yt_lite_native_player_proof::{fallback_after_playback_error, preferred_playback_provider};
+    assert_eq!(preferred_playback_provider(Provider::Auto), Provider::YtDlp);
+    assert_eq!(preferred_playback_provider(Provider::Rust), Provider::Rust);
+    assert_eq!(preferred_playback_provider(Provider::YtDlp), Provider::YtDlp);
+    assert_eq!(fallback_after_playback_error(Provider::YtDlp, Provider::Auto), Some(Provider::Rust));
+    assert_eq!(fallback_after_playback_error(Provider::Rust, Provider::Auto), None);
     assert_eq!(fallback_after_playback_error(Provider::Rust, Provider::Rust), None);
     assert_eq!(fallback_after_playback_error(Provider::YtDlp, Provider::YtDlp), None);
 }
