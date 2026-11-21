@@ -34,6 +34,14 @@ pub enum Capability<T> {
     Unknown,
 }
 
+/// Only forwarding non-secret HTTP compatibility fields. Never store or
+/// relay cookies or Authorization headers from extractor results.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HttpPlaybackHeaders {
+    pub user_agent: Option<String>,
+    pub referer: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stream {
     pub format_id: String,
@@ -43,6 +51,8 @@ pub struct Stream {
     pub fps: Option<f64>,
     pub has_video: bool,
     pub has_audio: bool,
+    #[serde(default)]
+    pub http_headers: HttpPlaybackHeaders,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +217,21 @@ fn number(value: &Value) -> Option<f64> {
     value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
+fn safe_http_header(value: &Value) -> Option<String> {
+    string(value).filter(|s| s.len() <= 512 && !s.chars().any(char::is_control))
+}
+
+fn playback_http_headers(root: &Value, format: &Value) -> HttpPlaybackHeaders {
+    let root_fields = at(root, &["http_headers", "httpHeaders"]);
+    let format_fields = at(format, &["http_headers", "httpHeaders"]);
+    let get = |key: &str| safe_http_header(&format_fields[key])
+        .or_else(|| safe_http_header(&root_fields[key]));
+    HttpPlaybackHeaders {
+        user_agent: get("User-Agent"),
+        referer: get("Referer"),
+    }
+}
+
 fn formats(root: &Value) -> Capability<Stream> {
     let Some(entries) = root.get("formats").and_then(Value::as_array) else { return Capability::Unknown };
     let items = entries.iter().filter_map(|v| {
@@ -223,7 +248,8 @@ fn formats(root: &Value) -> Capability<Stream> {
         // must not be advertised as selectable audio/video streams.
         if !has_video && !has_audio { return None; }
         Some(Stream { format_id, url, width: integer(&v["width"]), height: integer(&v["height"]),
-            fps: number(&v["fps"]), has_video, has_audio })
+            fps: number(&v["fps"]), has_video, has_audio,
+            http_headers: playback_http_headers(root, v) })
     }).collect::<Vec<_>>();
     if items.is_empty() { Capability::Unavailable } else { Capability::Available(items) }
 }
