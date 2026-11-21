@@ -164,7 +164,7 @@ impl Player {
         Ok(player)
     }
 
-    pub fn setup_render(&mut self, ui: Weak<PlayerWindow>, clip: &Path) -> Result<(), String> {
+    pub fn setup_render(&mut self, ui: Weak<PlayerWindow>, clip: Option<&Path>) -> Result<(), String> {
         if !self.context.is_null() { return Ok(()); }
         let mut ctx = ptr::null_mut();
         let init = OpenGlInitParams { get_proc_address: Some(gl_proc), get_proc_address_ctx: ptr::null_mut() };
@@ -180,9 +180,27 @@ impl Player {
         unsafe { (self.api.render_callback)(ctx, Some(redraw_callback), (&*wake as *const Wake).cast_mut().cast()) };
         self.wake = Some(wake);
         if !self.loaded {
-            self.send_strings(&["loadfile".into(), clip.to_string_lossy().into_owned(), "replace".into()])?;
-            self.loaded = true;
+            if let Some(clip) = clip {
+                self.send_strings(&["loadfile".into(), clip.to_string_lossy().into_owned(), "replace".into()])?;
+                self.loaded = true;
+            }
         }
+        Ok(())
+    }
+
+    pub fn is_render_ready(&self) -> bool {
+        !self.context.is_null()
+    }
+
+    pub fn load_network_stream(&mut self, url: &str) -> Result<(), String> {
+        if !self.is_render_ready() {
+            return Err("libmpv render context is not ready yet".into());
+        }
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err("Extractor returned a non-HTTP streaming URL".into());
+        }
+        self.send_strings(&["loadfile".into(), url.into(), "replace".into()])?;
+        self.loaded = true;
         Ok(())
     }
 
