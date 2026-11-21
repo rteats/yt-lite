@@ -15,12 +15,12 @@ cargo run -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --provider auto
 
 **Current yt-dlp dependency:** For full YouTube support, yt-dlp needs a JavaScript runtime to solve YouTube challenges. Its [official EJS guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS) recommends Deno (minimum 2.3.0 in the referenced guide), enabled by default. The official Windows `yt-dlp.exe` bundles the required EJS scripts, **but not Deno**. Put `deno.exe` on `PATH` or beside `yt-dlp.exe`, then check `deno --version`. Because the harness passes `--ignore-config`, it cannot rely on user yt-dlp configuration to enable nondefault JS runtimes. A self-contained bundled runtime is tracked by issue #4.
 
-The default output is a **privacy-safe JSON capability summary** containing provider, duration, stream counts, captions and chapters. It intentionally excludes video IDs, stream/caption URLs, thumbnails and channel/title metadata. Each capability distinguishes `available`, `unavailable` and `unknown`. `unknown` means not reported, not necessarily absent.
+The default output is a **privacy-safe JSON capability summary** containing provider, duration, stream counts, captions and chapters. It intentionally excludes video IDs, stream/caption URLs, thumbnails and channel/title metadata. Each capability distinguishes `available`, `unavailable` and `unknown`. `unknown` means not reported, not necessarily absent. `video_streams` counts any stream containing video, including `muxed_streams` (both audio and video) and `video_only_streams` (no audio). `audio_only_streams` counts audio-only formats. yt-dlp storyboard/image entries are excluded from the playable stream count. Caption counts are track/format entries, not distinct languages.
 
 `--provider auto` (default) falls back to yt-dlp when the Rust extraction route fails or returns no streams. Supply `--yt-dlp PATH` if the helper is not on `PATH`.
 
 Use `--raw-json` **only for private debugging** when signed streaming URLs are necessary; its output must not be posted to issues, logs or public reports. `--summary` explicitly selects the safe/default output.
 
-Live YouTube extraction is **not established by the offline CI**. Run the Windows checks in [extraction feasibility notes](docs/extraction-feasibility.md) and share only the safe summaries/error codes.
+Both providers successfully resolved one public YouTube video on Windows in a user test (2026-11-21). This does **not** yet establish playback compatibility or reliability across representative video types. Run the remaining Windows checks in [extraction feasibility notes](docs/extraction-feasibility.md) and share only the safe summaries/error codes.
 
 See [approved implementation spec](https://github.com/rteats/yt-lite/blob/docs/grill-round-10/docs/specification.md).
