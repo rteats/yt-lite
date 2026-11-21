@@ -114,6 +114,8 @@ pub struct ExtractionSummary {
     pub duration_seconds: Option<u64>,
     pub streams: CapabilityCount,
     pub video_streams: usize,
+    pub muxed_streams: usize,
+    pub video_only_streams: usize,
     pub audio_only_streams: usize,
     pub captions: CapabilityCount,
     pub automatic_caption_tracks: usize,
@@ -123,12 +125,14 @@ pub struct ExtractionSummary {
 /// Public reporting seam; drops sensitive provider URLs rather than redacting
 /// serialized JSON after the fact.
 pub fn summarize_extraction(result: &ExtractionResult) -> ExtractionSummary {
-    let (video_streams, audio_only_streams) = match &result.streams {
+    let (video_streams, muxed_streams, video_only_streams, audio_only_streams) = match &result.streams {
         Capability::Available(streams) => (
             streams.iter().filter(|stream| stream.has_video).count(),
+            streams.iter().filter(|stream| stream.has_video && stream.has_audio).count(),
+            streams.iter().filter(|stream| stream.has_video && !stream.has_audio).count(),
             streams.iter().filter(|stream| stream.has_audio && !stream.has_video).count(),
         ),
-        _ => (0, 0),
+        _ => (0, 0, 0, 0),
     };
     let automatic_caption_tracks = match &result.captions {
         Capability::Available(captions) => captions.iter().filter(|c| c.automatic).count(),
@@ -139,6 +143,8 @@ pub fn summarize_extraction(result: &ExtractionResult) -> ExtractionSummary {
         duration_seconds: result.duration_seconds,
         streams: (&result.streams).into(),
         video_streams,
+        muxed_streams,
+        video_only_streams,
         audio_only_streams,
         captions: (&result.captions).into(),
         automatic_caption_tracks,
