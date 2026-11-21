@@ -50,6 +50,10 @@ slint::slint! {
                     background: #677381;
                     border-radius: 4px;
                     Rectangle {
+                        // Slint centers implicitly positioned children. Anchor the
+                        // fill at the left edge so progress grows left-to-right.
+                        x: 0px;
+                        y: 0px;
                         width: parent.width * root.fraction;
                         height: parent.height;
                         background: #59baff;
