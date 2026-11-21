@@ -1,0 +1,52 @@
+# Native Slint/libmpv rendering proof — issue #2
+
+This is a **Windows x64 feasibility experiment**, not a release, not yet a verified playback result.
+
+## Run locally on Windows 10/11
+
+1. Build the prototype: `cargo build --release --manifest-path experiments/native-player/Cargo.toml`.
+2. Place a compatible x64 `mpv-2.dll` and its **required runtime DLL dependencies** next to `target/release/yt-lite-native-player-proof.exe` (or run the corresponding debug executable with the DLLs alongside it). Do not use an unofficial DLL.
+3. Use your own non-DRM local 1080p H.264 MP4 test clip, then launch:
+
+```powershell
+.\experiments\native-player\target\release\yt-lite-native-player-proof.exe "C:\test\sample.mp4"
+```
+
+The crate uses the default, isolated Cargo `target` directory under `experiments/native-player`; adjust the command if you override `CARGO_TARGET_DIR`.
+
+- Seek by +/-10 seconds, click the scrub bar, pause/resume, resize, and toggle fullscreen.
+- Inspect video **beneath** the Slint overlay. Verify that none of these operations creates a second player or restarts the clip.
+- Compare `hwdec=auto-safe` with `hwdec=no` in this experiment. Check mpv log output or the hardware decoder property before claiming hardware acceleration.
+- Measure 24/30/60 fps clips, resize transitions, fullscreen transitions, dropped frames, and overlay responsiveness on Windows 10. Record frame times and display-refresh mismatches.
+- On GPU/renderer incompatibility, record failure and try a separate renderer experiment; do not silently switch to a child-window/opaque overlay implementation.
+
+## Architecture
+
+- One process, one Slint `Window`, one mpv core, one mpv render context.
+- `RenderingSetup` creates the OpenGL render context; `BeforeRendering` draws video into the current framebuffer; Slint draws a transparent overlay above it; `RenderingTeardown` frees the context.
+- Frame notifications enter the Slint event loop through a queued weak component handle, never directly from the mpv callback thread.
+- Playback commands are asynchronous, and the control-action mapping is separately tested without a DLL or video asset.
+- `mpv-2.dll` is loaded from the **executable directory only**. The prototype intentionally does not download or bundle third-party binaries.
+- The Windows WGL + desktop-OpenGL path is selected deliberately to avoid pretending untested ANGLE/Direct3D hardware-interoperability is proven.
+
+## Verification matrix
+
+| Check | Status |
+| --- | --- |
+| Rust typecheck and action tests on Windows CI | Pending GitHub Actions |
+| Native playback and compositing on Windows 10 x64 | Not yet measured |
+| Pause, seek, resize and fullscreen without player recreation | Not yet measured |
+| Hardware/software decode and frame pacing | Not yet measured |
+| Clean-system runtime DLL packaging, licenses | Separate issue #4 |
+
+## Risks / fallback
+
+- Slint FemtoVG and libmpv both use OpenGL state. The render API may modify GL state; verify Slint controls remain correctly drawn after playback and resizes.
+- The direct desktop OpenGL path may not expose the best D3D11VA hardware decode zero-copy route. Quantify actual decode and CPU/GPU cost before deciding on production rendering.
+- Local property polling uses synchronous mpv property reads on the UI thread. If profiling shows frame stalls, replace with mpv property observation from a separate worker thread. Do **not** set `MPV_RENDER_PARAM_ADVANCED_CONTROL` without ensuring independent renderer/core threads.
+- Future fallback candidates are a carefully verified ANGLE render path or a separate video window with Slint overlay handling; neither is implemented here.
+- Reference implementations such as Lumiere and Vayou-Slint were researched for architectural feasibility, not copied. The C API signatures are declared against mpv's ISC-licensed public headers. All third-party redistribution conditions remain open until issue #4.
+
+## Expected test record
+
+Windows build and libmpv versions; GPU/driver and refresh rate; codec/resolution/frame rate; hwdec mode; presentation mode; 30-second CPU/GPU/memory baseline; dropped/mistimed frame counts; seek, pause, resize, fullscreen outcomes; screenshot of overlaid controls; blockers and fallback decision.
