@@ -242,7 +242,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(response) = pending.take() {
-            if !label_player.borrow().is_render_ready() {
+            let renderer_ready = { label_player.borrow().is_render_ready() };
+            if !renderer_ready {
                 // The Slint rendering notifier must establish mpv's GL context
                 // before we hand its playback core a signed media URL.
                 pending = Some(response);
