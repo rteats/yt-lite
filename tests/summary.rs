@@ -11,7 +11,6 @@ fn summarizes_yt_dlp_capabilities_without_exposing_provider_details() {
     ).unwrap();
     let summary = summarize_extraction(&result);
     assert_eq!(summary.provider, Provider::YtDlp);
-    assert_eq!(summary.video_id, ID);
     assert_eq!(summary.streams.status, CapabilityStatus::Available);
     assert_eq!(summary.streams.count, 2);
     assert_eq!(summary.video_streams, 1);
@@ -25,6 +24,7 @@ fn summarizes_yt_dlp_capabilities_without_exposing_provider_details() {
     let json = serde_json::to_string(&summary).unwrap();
     assert!(!json.contains("example.test"));
     assert!(!json.contains("https://"));
+    assert!(!json.contains(ID));
     assert!(!json.contains("Sample music video"));
     assert!(!json.contains("Sample channel"));
     assert!(!json.contains("thumbnail"));
