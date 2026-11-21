@@ -5,8 +5,12 @@ yt-lite is a local-first desktop client for browsing and playing YouTube content
 ## People and content
 
 **Local profile**:
-An identity inside yt-lite with its own subscriptions, history, playlists, playback progress, feed preferences, and visible offline-library items. It is not a Google account.
+An identity inside yt-lite with its own subscriptions, history, playlists, playback progress, playback queue, feed preferences, and visible offline-library items. It is not a Google account.
 _Avoid_: Google account, login
+
+**Private session**:
+A temporary browsing and playback context that does not add viewing history, playback progress, or recommendation signals to a profile.
+_Avoid_: Local profile
 
 **Subscription**:
 A local decision to follow a YouTube channel and include its uploads in subscription views. It does not imply subscribing through a Google account.
@@ -27,7 +31,7 @@ An independently navigable browsing context; tabs do not each own a separate vid
 The single active video playback state, retained when the player moves between the watch page, mini-player, detached window, and fullscreen.
 
 **Playback queue**:
-An ordered list of videos awaiting playback, managed independently of download jobs.
+A profile-owned ordered list of videos awaiting playback, managed independently of download jobs and restored without automatic playback.
 _Avoid_: Download queue
 
 **Download job**:
