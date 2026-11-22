@@ -195,6 +195,72 @@ as well as seek behavior inside vs outside the buffered range. The
 current proven incremental streaming and memory bounds remain intact.
 See [issue #30](https://github.com/rteats/yt-lite/issues/30).
 
+## Startup phase diagnostic (issue #30)
+
+The previous extraction-variant A/B experiment found **no repeatable speed
+advantage** and manifest skipping lost 15 selectable media formats. The
+full-featured yt-dlp extractor remains the default.
+
+A new standalone PowerShell profiler separates a **`--version` command
+runtime proxy** from the time yt-dlp takes to resolve a watch URL. It
+watches a small allowlist of yt-dlp verbose event *categories* in memory:
+
+- First debug line (an approximate initialization signal)
+- First logged webpage fetch announcement
+- First logged player API request announcement
+- First JavaScript challenge-related message
+- First logged manifest fetch announcement
+- Number of observed API and JavaScript messages
+- Total extraction elapsed time, playable media-format count and combined
+  audio+video format count
+
+It neither prints raw verbose messages nor saves metadata, signed CDN
+URLs, cookies or video files. Each video is specified as an **11-character
+public YouTube video ID**, not an arbitrary URI or shell argument. The
+`--version` measurement is **not pure process spawn cost**: it includes
+executable/runtime initialization and may skip normal extractor loading.
+
+From a Windows PowerShell session in the repository root:
+
+```powershell
+git switch feat/native-watch-shell-05
+git pull --ff-only
+
+# Local offline validation; does not launch yt-dlp.
+.\experiments\native-player\profile-yt-dlp.ps1 -SelfTest
+
+# Two measured passes of the public test video.
+.\experiments\native-player\profile-yt-dlp.ps1 -Repetitions 2
+
+# For a second public test video, pass only its 11-character ID.
+.\experiments\native-player\profile-yt-dlp.ps1 -VideoId VIDEO_ID_11 -Repetitions 2
+```
+
+The last example uses a placeholder; substitute a valid ID. If script
+execution is restricted by local PowerShell policy, launch with
+`powershell.exe -NoProfile -File .\experiments\native-player\profile-yt-dlp.ps1`,
+under the user's own configured execution policy.
+
+**Interpretation:** each milestone timestamp is when a message was
+*observed*, usually at the start of a request or challenge step. The
+difference between two milestones includes any network, local
+processing and omitted work; it cannot identify exact DNS, TLS,
+network, EJS runtime or subprocess costs. The `--verbose` flag itself
+adds overhead and is intentionally **not** part of the production
+extractor invocation.
+
+Compare `VersionMs`, `FirstDebugMs` and `ExtractMs` across attempts.
+Missing milestones are reported as blanks rather than assigned fake zeroes.
+If the majority of time occurs after the first webpage/API announcement,
+investigate requests/challenges with controlled experiments. If version
+runtime is unusually high, investigate packaging and process launch
+without conflating the two kinds of work.
+
+For evidence before a code change, use at least two videos, alternate
+their test order, and confirm any optimization retains muxed A/V,
+required formats/captions, and actual streaming/seek behavior. Issue
+[#30](https://github.com/rteats/yt-lite/issues/30) tracks those gates.
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
