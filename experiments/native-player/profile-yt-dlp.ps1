@@ -80,6 +80,9 @@ for ($round = 1; $round -le $Repetitions; $round++) {
     $milestones = @{}
     $jsSignals = 0
     $apiSignals = 0
+    $manifestSignals = 0
+    $lastManifestMs = $null
+    $lastJscMs = $null
     $result = 'failed'
     $formats = $null
     $muxed = $null
@@ -109,8 +112,15 @@ for ($round = 1; $round -le $Repetitions; $round++) {
             if ($kind) {
                 $elapsed = [int] $watch.ElapsedMilliseconds
                 if (-not $milestones.ContainsKey($kind)) { $milestones[$kind] = $elapsed }
-                if ($kind -eq 'javascript') { $jsSignals++ }
+                if ($kind -eq 'javascript') {
+                    $jsSignals++
+                    $lastJscMs = $elapsed
+                }
                 if ($kind -eq 'player_api') { $apiSignals++ }
+                if ($kind -eq 'manifest') {
+                    $manifestSignals++
+                    $lastManifestMs = $elapsed
+                }
             }
             $stderrTask = $process.StandardError.ReadLineAsync()
         }
@@ -162,6 +172,10 @@ for ($round = 1; $round -le $Repetitions; $round++) {
         PlayerApiMs = if ($milestones.ContainsKey('player_api')) { $milestones['player_api'] } else { $null }
         JscSignalMs = if ($milestones.ContainsKey('javascript')) { $milestones['javascript'] } else { $null }
         ManifestMs = if ($milestones.ContainsKey('manifest')) { $milestones['manifest'] } else { $null }
+        LastManifestMs = $lastManifestMs
+        ManifestSignals = $manifestSignals
+        AfterLastManifestMs = if ($null -ne $lastManifestMs) { [int] ($watch.ElapsedMilliseconds - $lastManifestMs) } else { $null }
+        LastJscMs = $lastJscMs
         ApiSignals = $apiSignals
         JscSignals = $jsSignals
         Media = $formats
