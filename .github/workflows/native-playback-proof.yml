@@ -30,5 +30,17 @@ jobs:
             Write-Error ($errors | Out-String)
             exit 1
           }
+      - name: Profile script syntax and offline milestone tests
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("experiments/native-player/profile-yt-dlp.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            Write-Error ($errors | Out-String)
+            exit 1
+          }
+          & ./experiments/native-player/profile-yt-dlp.ps1 -SelfTest
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit 1 }
       - run: cargo check --manifest-path experiments/native-player/Cargo.toml --all-targets
       - run: cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets
