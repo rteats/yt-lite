@@ -18,7 +18,8 @@ function Get-SafeMilestone {
     # Parse only known textual categories, never return a raw line or its URL.
     if ($Line -match '(?i)^\[youtube\][^:]*:\s+Downloading webpage') { return 'webpage' }
     if ($Line -match '(?i)^\[youtube\].*Downloading .*player API JSON') { return 'player_api' }
-    if ($Line -match '(?i)\[jsc(?::[^]]+)?\]') { return 'javascript' }
+    # A generic [jsc] provider listing does not prove a solver ran.
+    if ($Line -match '(?i)\[jsc:[^]]+\]') { return 'javascript' }
     if ($Line -match '(?i)^\[youtube\].*Downloading .*?(m3u8|mpd|manifest)') { return 'manifest' }
     if ($Line -match '(?i)^\[debug\]') { return 'debug' }
     return $null
@@ -29,6 +30,7 @@ if ($SelfTest) {
         @{ Text = '[youtube] SAMPLE12345: Downloading webpage'; Kind = 'webpage' },
         @{ Text = '[youtube] SAMPLE12345: Downloading web player API JSON'; Kind = 'player_api' },
         @{ Text = '[debug] [youtube] [jsc:deno] Using challenge solver'; Kind = 'javascript' },
+        @{ Text = '[debug] [youtube] [jsc] JS Challenge Providers: deno'; Kind = 'debug' },
         @{ Text = '[youtube] SAMPLE12345: Downloading m3u8 information'; Kind = 'manifest' },
         @{ Text = '[debug] Loaded 1800 extractors'; Kind = 'debug' },
         @{ Text = 'https://signed.example.test/?token=SECRET'; Kind = $null }
