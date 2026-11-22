@@ -261,6 +261,66 @@ their test order, and confirm any optimization retains muxed A/V,
 required formats/captions, and actual streaming/seek behavior. Issue
 [#30](https://github.com/rteats/yt-lite/issues/30) tracks those gates.
 
+## Two-video startup phase measurements (2026-11-22)
+
+The user ran `profile-yt-dlp.ps1 -Repetitions 2` against the original
+test video (`dQw4w9WgXcQ`) and a second public video
+(`fq-Xn7ZOZtg`). The successful outputs each reported at least one
+combined audio/video stream, and the shown media counts were 43.
+
+| Marker, elapsed from process start | Original video mean | Second video mean |
+| --- | ---: | ---: |
+| `yt-dlp --version` wall time (separate process) | 1,589 ms | 1,496 ms |
+| First debug announcement | 998 ms | 1,007 ms |
+| First webpage announcement | 1,437 ms | 1,410 ms |
+| First player API announcement | 2,478 ms | 2,584 ms |
+| First tagged JS solver message | 3,040 ms | 3,224 ms |
+| First manifest announcement | 4,817 ms | 4,989 ms |
+| **Total extraction** | **5,914 ms** | **8,017 ms** |
+| **After first manifest announcement** | **1,098 ms** | **3,028 ms** |
+
+The second video took about **2,103 ms longer** overall, even though
+its first manifest announcement came only about 173 ms later. The
+roughly **1,930 ms extra elapsed after that announcement** accounts
+for most of the observed difference. It is not necessarily "manifest
+download time": this interval may contain subsequent manifest fetches,
+network/JavaScript work, or final parsing. No per-request completion
+times are available.
+
+The `--version` measurement is not pure process creation cost and
+must **not** be subtracted from extraction (different code paths).
+The four JS signal messages and two player API messages per run are
+event counts, not separate network request totals or evidence of
+exact EJS CPU time. The two videos were not alternated in test order.
+
+### Next diagnostic: last manifest marker
+
+The profiler now reports additional, non-sensitive fields:
+
+- `ManifestSignals`: number of manifest messages recognized
+- `LastManifestMs`: timestamp of the last recognized manifest
+  announcement
+- `AfterLastManifestMs`: total time remaining after that message
+- `LastJscMs`: last recognized tagged JS solver message
+
+If `LastManifestMs` is much later on the second video, repeated
+manifest work may explain the larger tail. If it is similarly early on
+both videos, the remaining gap is downstream of the logged manifest
+announcements. These are still **observations**, not exact request
+durations. Keep the currently working extractor and bounded streaming
+configuration unchanged.
+
+```powershell
+git switch feat/native-watch-shell-05
+git pull --ff-only
+powershell.exe -NoProfile -File .\experiments\native-player\profile-yt-dlp.ps1 -Repetitions 2
+powershell.exe -NoProfile -File .\experiments\native-player\profile-yt-dlp.ps1 -VideoId fq-Xn7ZOZtg -Repetitions 2
+```
+
+No raw URL, cookie, signed media link or unfiltered yt-dlp debug log
+is needed. The performance follow-up is
+[issue #30](https://github.com/rteats/yt-lite/issues/30).
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
