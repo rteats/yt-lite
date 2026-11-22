@@ -160,6 +160,41 @@ optimization preserves required user-facing behavior.
 
 Tracked in [issue #30](https://github.com/rteats/yt-lite/issues/30).
 
+## First yt-dlp extraction A/B results (2026-11-22)
+
+The user ran `bench-yt-dlp.ps1 -Repetitions 2` on their Windows
+machine. Each variant used the same public video, and no media was
+downloaded. Times below are **metadata extraction only**, not playback
+startup. The script ran variants in a fixed order, so warm cache,
+network variation, and upstream variability could affect timings.
+
+| Variant | Run 1 | Run 2 | Mean | Media formats | Muxed | Video-only | Audio-only | Auto-caption entries |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 5,576 ms | 5,043 ms | **5,309.5 ms** | 43 | 1 | 37 | 5 | 1,104 |
+| Skip translated subs | 5,506 ms | 6,516 ms | 6,011 ms | 43 | 1 | 37 | 5 | 1,104 |
+| Skip HLS/DASH manifests and translated subs | 4,855 ms | 6,464 ms | 5,659.5 ms | 28 | 1 | 22 | 5 | 1,099 |
+
+Against the baseline, skipping translated subtitles averaged **701.5 ms
+slower** (~13.2%), with no count differences on this video; skipping
+manifests averaged **350 ms slower** (~6.6%) and lost **15 out of 43
+media entries (~35%)**, all from the video-only count, plus five
+automatic-caption format entries. One faster individual run with
+manifest skipping is not consistent evidence of improvement.
+
+**Decision:** do **not** enable either skip option as the default.
+The existing yt-dlp invocation is preserved. Both skip variants require
+broader randomized/repeated tests and real-playback validation before
+they could be considered as opt-in experiments, especially for
+live/HLS, captions and multi-track quality selection. Two repeated
+runs on a single public URL are too few to establish statistically
+reliable speed differences.
+
+The next latency work should measure cold/warm yt-dlp subprocess,
+network/extractor challenge stages and end-to-end first-frame timing,
+as well as seek behavior inside vs outside the buffered range. The
+current proven incremental streaming and memory bounds remain intact.
+See [issue #30](https://github.com/rteats/yt-lite/issues/30).
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
