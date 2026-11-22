@@ -42,5 +42,8 @@ jobs:
           }
           & ./experiments/native-player/profile-yt-dlp.ps1 -SelfTest
           if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit 1 }
+      - name: Profile script offline self-test (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\\experiments\\native-player\\profile-yt-dlp.ps1 -SelfTest
       - run: cargo check --manifest-path experiments/native-player/Cargo.toml --all-targets
       - run: cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets
