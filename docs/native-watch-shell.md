@@ -208,7 +208,7 @@ watches a small allowlist of yt-dlp verbose event *categories* in memory:
 - First debug line (an approximate initialization signal)
 - First logged webpage fetch announcement
 - First logged player API request announcement
-- First JavaScript challenge-related message
+- First tagged JavaScript solver message (a generic list of available challenge providers is not counted)
 - First logged manifest fetch announcement
 - Number of observed API and JavaScript messages
 - Total extraction elapsed time, playable media-format count and combined
