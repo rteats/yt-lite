@@ -122,7 +122,7 @@ slint::slint! {
                 }
                 Text {
                     text: root.video-subtitle;
-                    color: root.dark-mode ? #d2d7e2 : #34485e;
+                    color: root.dark-mode ? #d2d7e2 : #34485f;
                     font-size: 12px;
                     vertical-alignment: center;
                     overflow: elide;
@@ -254,7 +254,7 @@ slint::slint! {
                             y: 37px;
                             width: parent.width - 16px;
                             height: 20px;
-                            color: root.dark-mode ? #d2d7e2 : #34485e;
+                            color: root.dark-mode ? #d2d7e2 : #34485f;
                             font-size: 11px;
                             overflow: elide;
                             vertical-alignment: center;
@@ -319,13 +319,13 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
 /// Public, fixed-origin thumbnail fetch on a separate worker. It never blocks
 /// media extraction or the Slint UI thread and never follows cross-origin redirects.
 /// Reject oversized responses without reading the complete payload into memory.
-fn spawn_thumbnail(video_id: String) -> Receiver<Option<Vec<u8>>> {
+fn spawn_thumbnail(video_id: String) -> Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Option<Vec<u8>> {
+        let result = (|| -> Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>> {
             let url = public_youtube_thumbnail_url(&video_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
-            runtime.block_on(async {
+            let bytes = runtime.block_on(async {
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .timeout(Duration::from_secs(6)).build().ok()?;
@@ -352,7 +352,16 @@ fn spawn_thumbnail(video_id: String) -> Receiver<Option<Vec<u8>>> {
                     }
                 }
                 (!bytes.is_empty()).then_some(bytes)
-            })
+            })?;
+            // Decode on the worker, not in Slint's render/event loop.
+            let rgb = image::load_from_memory(&bytes).ok()?.to_rgb8();
+            let (width, height) = rgb.dimensions();
+            if width == 0 || height == 0 || width > 1024 || height > 1024 {
+                return None;
+            }
+            Some(slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                rgb.as_raw(), width, height,
+            ))
         })();
         let _ = sender.send(result);
     });
