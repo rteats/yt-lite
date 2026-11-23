@@ -119,3 +119,11 @@ fn player_video_margins_reserve_logical_chrome_even_at_150_percent_dpi() {
     let (small_top, small_bottom) = video_margin_ratios(100, 2.0, true);
     assert!(small_top + small_bottom <= 0.9 + f64::EPSILON);
 }
+
+#[test]
+fn search_sidebar_reserves_right_side_without_obscuring_video() {
+    use yt_lite_native_player_proof::search_margin_ratio;
+    assert_eq!(search_margin_ratio(1500, 1.5, false), 0.0);
+    assert!((search_margin_ratio(1500, 1.5, true) - 0.37).abs() < 0.001);
+    assert!(search_margin_ratio(400, 2.0, true) <= 0.65);
+}
