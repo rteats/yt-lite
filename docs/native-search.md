@@ -24,9 +24,14 @@ $helper = (Get-Command yt-dlp).Source
 Use the existing top field to type a short search phrase (for example
 `rust slint tutorial`) and press **Enter** or click **Search**.
 Entering a YouTube URL and pressing **Enter**, or clicking **Open**
-explicitly, opens the video instead. Up to eight videos should appear
-in a right-side native results panel. Click a video row to open its canonical YouTube URL and
-play it in the **same** libmpv session. Use **Close** to dismiss search.
+explicitly, opens the video instead. The first eight results appear
+in the native panel. Use **Load more results** to request another eight,
+up to 40, without closing the current player. The helper repeats the
+longer prefix using `ytsearch16:`, `ytsearch24:`, etc. rather than a
+pagination cursor; loading more may take several seconds, and ordering
+may change if YouTube reranks results. Already loaded thumbnail images
+are retained by video ID. Click a video row to open its canonical YouTube
+URL and play it in the **same** libmpv session. Use **Close** to dismiss search.
 
 ## Manual acceptance checks
 
@@ -45,8 +50,9 @@ play it in the **same** libmpv session. Use **Close** to dismiss search.
 
 ## Implementation and scope
 
-- Search uses **only local yt-dlp** with `ytsearch8:` and
-  `--flat-playlist`. It does not require Google login, export
+- Search uses **only local yt-dlp** with bounded `ytsearchN:`
+  counts (8, 16, 24, 32, 40) and `--flat-playlist`.
+  It does not require Google login, export
   cookies, automatically use third-party proxies, or download
   media files. Search queries are limited to 120 non-control characters.
 - Search results contain validated public 11-character video IDs, titles,
@@ -56,8 +62,9 @@ play it in the **same** libmpv session. Use **Close** to dismiss search.
   responses are discarded when a new search or video open supersedes them.
 - Offline root tests verify parsing, input validation, empty and malformed
   responses. CI does **not** contact YouTube.
-- Full search filters, paging, provider fallback,
-  accessibility review and polished responsive layout remain open before
+- Full search filters, cursor-based paging (the current Load more
+  refetches a longer prefix), provider fallback, accessibility review
+  and polished responsive layout remain open before
   #7 acceptance. Public yt-dlp search availability is not guaranteed
   because YouTube's external behavior changes.
 
@@ -134,4 +141,59 @@ which used to fail with `No combined audio+video HTTP stream`, verify
 **visible video, audible audio and audio/video sync after seeking**.
 Also test changing search results repeatedly. The split-stream fallback
 is new and has not yet been verified against a real YouTube video.
+
+
+
+## Search result depth and automatic quality follow-up — 2026-11-23
+
+The user confirmed that **separate audio/video sync is good**, but
+reported that results were always limited to eight and playback image
+quality was relatively low.
+
+**Search:** yt-dlp was called with `ytsearch8:` and the JSON parser
+also truncated results to eight. The parser now permits up to 40
+validated hits and the native **Load more results** button requests
+eight additional results at a time. Duplicate upstream search work
+is bounded, but this is **not** efficient cursor pagination; it
+re-extracts the leading N results each time. A new query resets the
+page count and drops stale thumbnail callbacks.
+
+**Automatic playback quality:** previously `select_playback_streams`
+always picked a muxed A/V stream when one existed, even if its only
+resolution was 360p and separate 1080p video+audio were available.
+The policy now prefers a **compatible separate video/audio pair only
+when its picture resolution is greater** than the best muxed candidate.
+Among separate tracks, it prefers the highest available format at
+or below **1080p**; if none exists, it uses the highest available
+separate format. A muxed stream remains preferred at equal/better
+resolution. The selected resolution and A/V mode are logged **without
+any CDN URLs**.
+
+If high-resolution split playback fails and an extracted muxed
+stream is available, the same libmpv session retries that combined
+format **without re-running extraction**. Only after that fallback
+fails does the existing provider/retry logic apply. These changes
+keep the bounded in-memory mpv streaming cache, and audio remains
+attached with `audio-add` on the same decoder session.
+
+The current metadata adapter exposes resolution, but not yet
+codec/bitrate performance preferences. Automatic 1080p is an
+initial quality policy, **not** a replacement for the full quality
+selector in issue [#10](https://github.com/rteats/yt-lite/issues/10).
+
+### Acceptance for this increment
+
+1. Search for `rick astley`: inspect the initial eight results,
+   select **Load more results**, and confirm the list expands
+   (16, then 24, up to 40 or exhaustion) without disrupting playback.
+2. Open a video offering higher-resolution separate tracks and
+   verify the console reports `selected 1080p separate A/V` when
+   that format is available. Confirm picture clarity, audio sync,
+   seeking and that the video still fits the reserved viewport.
+3. Open a video whose highest video-only track cannot be decoded or
+   fails to load. Verify that combined A/V fallback is attempted
+   when present, instead of leaving the player silent or frozen.
+4. Resize, use fullscreen, switch between search results and
+   inspect thumbnail loading; no regression from the existing watch
+   metadata and search UI is expected.
 
