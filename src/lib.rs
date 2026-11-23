@@ -392,6 +392,11 @@ pub async fn extract_playback(
     }
 }
 
+/// Search initially loads eight results. Each additional request retrieves
+/// a larger prefix because yt-dlp's ytsearchN accepts a count, not a cursor.
+pub const SEARCH_BATCH_SIZE: usize = 8;
+pub const SEARCH_MAX_RESULTS: usize = 40;
+
 /// Read-only video search result. The public watch URL is constructed from
 /// video_id later; this type cannot expose signed media URLs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +417,18 @@ pub fn validated_search_query(input: &str) -> Result<String, ProbeError> {
         ));
     }
     Ok(query.to_owned())
+}
+
+/// Validate a bounded ytsearchN target. The query remains one command
+/// argument and is never interpolated into a shell command.
+pub fn search_target(query: &str, count: usize) -> Result<String, ProbeError> {
+    let query = validated_search_query(query)?;
+    if count == 0 || count > SEARCH_MAX_RESULTS {
+        return Err(ProbeError::new("invalid_search_size",
+            "Search size must be between 1 and 40.",
+            "Use Load more to request the next batch."));
+    }
+    Ok(format!("ytsearch{count}:{query}"))
 }
 
 /// Parse yt-dlp's flat playlist search response; skip non-video entries and
@@ -436,15 +453,20 @@ pub fn parse_search_json(json: &str) -> Result<Vec<SearchHit>, ProbeError> {
             channel: string(at(item, &["channel", "uploader"])),
             duration_seconds: integer(&item["duration"]),
         })
-    }).take(8).collect())
+    }).take(SEARCH_MAX_RESULTS).collect())
 }
 
 /// Search via the existing on-device yt-dlp helper without extra proxy
 /// services, authentication, downloads, or per-result video extraction.
 /// The flat result's metadata is intentionally best-effort.
 pub async fn search_youtube(query: &str, helper: &Path) -> Result<Vec<SearchHit>, ProbeError> {
-    let query = validated_search_query(query)?;
-    let target = format!("ytsearch8:{query}");
+    search_youtube_with_limit(query, helper, SEARCH_BATCH_SIZE).await
+}
+
+/// Return the first N public search hits. Newer batches repeat earlier hits
+/// because yt-dlp's ytsearchN does not expose a stable pagination cursor.
+pub async fn search_youtube_with_limit(query: &str, helper: &Path, count: usize) -> Result<Vec<SearchHit>, ProbeError> {
+    let target = search_target(query, count)?;
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true).args([
         "--ignore-config", "--no-warnings", "--flat-playlist",
