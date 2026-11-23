@@ -56,27 +56,47 @@ pub enum PlaybackStreamSelection<'a> {
     },
 }
 
+/// Automatic playback targets at most 1080p when that resolution is
+/// available. The decoder can still use a larger track if it is the only
+/// separate-video candidate; manual quality controls belong to issue #10.
+pub const AUTO_PREFERRED_MAX_HEIGHT: u64 = 1080;
+
 pub fn select_playback_streams(
     info: &yt_lite_extraction_proof::ExtractionResult,
 ) -> Option<PlaybackStreamSelection<'_>> {
-    if let Some(muxed) = select_muxed_stream(info) {
-        return Some(PlaybackStreamSelection::Muxed(muxed));
-    }
+    let muxed = select_muxed_stream(info);
     let yt_lite_extraction_proof::Capability::Available(streams) = &info.streams else {
-        return None;
+        return muxed.map(PlaybackStreamSelection::Muxed);
     };
     let http = |s: &&yt_lite_extraction_proof::Stream| {
         s.url.starts_with("https://") || s.url.starts_with("http://")
     };
-    let video = streams.iter().filter(|s| s.has_video && !s.has_audio)
+    // Find a complete compatible pair first; an attractive video-only
+    // format without matching audio must not suppress valid lower formats.
+    let split = streams.iter()
+        .filter(|s| s.has_video && !s.has_audio)
         .filter(http)
-        .max_by_key(|s| (s.height.unwrap_or(0), s.width.unwrap_or(0)))?;
-    // mpv's request headers currently apply to both inputs. Do not pair
-    // streams that require incompatible referrers or User-Agent values.
-    let audio = streams.iter().filter(|s| s.has_audio && !s.has_video)
-        .filter(http)
-        .find(|s| s.http_headers == video.http_headers)?;
-    Some(PlaybackStreamSelection::Separate { video, audio })
+        .filter_map(|video| {
+            let audio = streams.iter()
+                .filter(|s| s.has_audio && !s.has_video)
+                .filter(http)
+                .find(|audio| audio.http_headers == video.http_headers)?;
+            Some((video, audio))
+        })
+        .max_by_key(|(video, _)| {
+            let height = video.height.unwrap_or(0);
+            (height <= AUTO_PREFERRED_MAX_HEIGHT, height, video.width.unwrap_or(0))
+        });
+    match (muxed, split) {
+        (Some(muxed), Some((video, audio)))
+            if video.height.unwrap_or(0) > muxed.height.unwrap_or(0) =>
+        {
+            Some(PlaybackStreamSelection::Separate { video, audio })
+        }
+        (Some(muxed), _) => Some(PlaybackStreamSelection::Muxed(muxed)),
+        (None, Some((video, audio))) => Some(PlaybackStreamSelection::Separate { video, audio }),
+        (None, None) => None,
+    }
 }
 
 /// Return mpv's video margins as fractions of the physical window height.
