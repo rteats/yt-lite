@@ -5,7 +5,7 @@
 mod mpv;
 
 use mpv::{PlaybackEvent, Player};
-use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
+use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_playback_streams, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
@@ -13,7 +13,13 @@ use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, pr
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox, LineEdit, ListView, Palette } from "std-widgets.slint";
 
-    export struct SearchRow { id: string, title: string, details: string }
+    export struct SearchRow {
+        id: string,
+        title: string,
+        details: string,
+        thumbnail: image,
+        has-thumbnail: bool,
+    }
 
     export component PlayerWindow inherits Window {
         title: "yt-lite / watch";
@@ -239,15 +245,29 @@ slint::slint! {
                 ListView {
                     for hit in root.search-results : Rectangle {
                         width: parent.width;
-                        height: 66px;
+                        height: 76px;
                         background: root.dark-mode ? #243043 : #e9eef3;
                         border-radius: 4px;
+                        Rectangle {
+                            x: 7px;
+                            y: 10px;
+                            width: 93px;
+                            height: 53px;
+                            background: root.dark-mode ? #34455b : #d5dfe6;
+                            Image {
+                                source: hit.thumbnail;
+                                visible: hit.has-thumbnail;
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: contain;
+                            }
+                        }
                         Text {
                             text: hit.title;
-                            x: 8px;
-                            y: 6px;
-                            width: parent.width - 16px;
-                            height: 30px;
+                            x: 108px;
+                            y: 7px;
+                            width: parent.width - 116px;
+                            height: 35px;
                             color: root.dark-mode ? white : #19242f;
                             font-size: 13px;
                             overflow: elide;
@@ -255,10 +275,10 @@ slint::slint! {
                         }
                         Text {
                             text: hit.details;
-                            x: 8px;
-                            y: 37px;
-                            width: parent.width - 16px;
-                            height: 20px;
+                            x: 108px;
+                            y: 43px;
+                            width: parent.width - 116px;
+                            height: 22px;
                             color: root.dark-mode ? #d2d7e2 : #34485f;
                             font-size: 11px;
                             overflow: elide;
@@ -628,6 +648,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
     let mut search_receiver: Option<Receiver<SearchResolution>> = None;
+    let mut search_rows: Option<Rc<slint::VecModel<SearchRow>>> = None;
+    let mut result_thumbnail_receivers: Vec<(usize, Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>>)> = Vec::new();
     let mut thumbnail_receiver: Option<Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>>> = None;
     let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
@@ -644,6 +666,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
         if let Some(query) = search_requested.borrow_mut().take() {
+            // Old thumbnails may finish late; never attach to new search rows.
+            result_thumbnail_receivers.clear();
+            search_rows = None;
             if let Some(ui) = label_window.upgrade() {
                 ui.set_show_search(true);
                 ui.set_search_results(slint::ModelRc::new(slint::VecModel::from(Vec::<SearchRow>::new())));
@@ -672,15 +697,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     format!("{} video results", results.len())
                                 };
-                                let rows = results.into_iter().map(|hit| {
-                                    let details = search_result_details(&hit);
-                                    SearchRow {
-                                        id: hit.video_id.into(),
-                                        title: hit.title.into(),
-                                        details: details.into(),
-                                    }
+                                let rows = results.iter().map(|hit| SearchRow {
+                                    id: hit.video_id.clone().into(),
+                                    title: hit.title.clone().into(),
+                                    details: search_result_details(hit).into(),
+                                    thumbnail: slint::Image::default(),
+                                    has_thumbnail: false,
                                 }).collect::<Vec<_>>();
-                                ui.set_search_results(slint::ModelRc::new(slint::VecModel::from(rows)));
+                                let model = Rc::new(slint::VecModel::from(rows));
+                                ui.set_search_results(model.clone().into());
+                                search_rows = Some(model);
+                                result_thumbnail_receivers = results.iter().enumerate()
+                                    .map(|(index, hit)| (index, spawn_thumbnail(hit.video_id.clone())))
+                                    .collect();
                                 ui.set_search_status(status.into());
                             }
                             Err(error) => ui.set_search_status(format!("Search failed: {error}").into()),
@@ -697,6 +726,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Apply image updates to the current search model only. Workers
+        // download/decode public thumbnails off the UI and video threads.
+        let mut pending_images = Vec::new();
+        for (index, receiver) in std::mem::take(&mut result_thumbnail_receivers) {
+            match receiver.try_recv() {
+                Ok(Some(pixels)) => {
+                    if let Some(model) = search_rows.as_ref() {
+                        if let Some(mut row) = model.row_data(index) {
+                            row.thumbnail = slint::Image::from_rgb8(pixels);
+                            row.has_thumbnail = true;
+                            model.set_row_data(index, row);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => pending_images.push((index, receiver)),
+                Ok(None) | Err(TryRecvError::Disconnected) => {}
+            }
+        }
+        result_thumbnail_receivers = pending_images;
+
         // A new watch URL replaces the current playback session but does not
         // construct a new libmpv core. In-flight extraction results are dropped.
         if let Some(input) = requested_url.borrow_mut().take() {
@@ -705,6 +754,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
                     *pending_seek_timing.borrow_mut() = None;
                     search_receiver = None;
+                    search_rows = None;
+                    result_thumbnail_receivers.clear();
                     if let Some(ui) = label_window.upgrade() { ui.set_show_search(false); }
                     // An explicit user Open action should start the new video
                     // even if the previous video was left paused.
