@@ -22,10 +22,10 @@ $helper = (Get-Command yt-dlp).Source
 ```
 
 Use the existing top field to type a short search phrase (for example
-`rust slint tutorial`), then click **Search**. Pressing **Enter** or
-clicking **Open** in that field still opens video URLs; it does not
-trigger search. Up to eight videos should appear in a right-side native
-results panel. Click a video row to open its canonical YouTube URL and
+`rust slint tutorial`) and press **Enter** or click **Search**.
+Entering a YouTube URL and pressing **Enter**, or clicking **Open**
+explicitly, opens the video instead. Up to eight videos should appear
+in a right-side native results panel. Click a video row to open its canonical YouTube URL and
 play it in the **same** libmpv session. Use **Close** to dismiss search.
 
 ## Manual acceptance checks
