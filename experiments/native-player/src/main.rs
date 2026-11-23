@@ -20,7 +20,7 @@ slint::slint! {
         preferred-width: 1000px;
         preferred-height: 640px;
         min-width: 660px;
-        min-height: 300px;
+        min-height: 480px;
         background: transparent;
 
         in-out property <bool> paused: false;
@@ -131,75 +131,79 @@ slint::slint! {
             }
         }
 
-        // The transparent window is deliberate: libmpv draws the GL underlay
-        // before Slint paints these controls over it.
+        // Reserve real space for the controls. Fixed pixel positions avoid
+        // Slint's vertical stretch distributing a row below the viewport
+        // at 125–200% Windows DPI scaling.
         Rectangle {
             width: parent.width;
-            height: 106px;
+            height: 116px;
             x: 0px;
             y: parent.height - self.height;
-            background: root.dark-mode ? #d51b202b : #e9f5f5f7;
-            VerticalBox {
-                padding: 10px;
-                spacing: 9px;
-                HorizontalBox {
-                    spacing: 8px;
-                    Text {
-                        text: root.status;
-                        color: root.dark-mode ? white : #19242f;
-                        font-size: 13px;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        overflow: elide;
-                    }
-                    Button {
-                        text: "Retry";
-                        visible: root.can-retry;
-                        clicked => { root.retry(); }
-                    }
+            background: root.dark-mode ? #ed1b202b : #eef1f4;
+            HorizontalBox {
+                x: 12px;
+                y: 7px;
+                width: parent.width - 24px;
+                height: 28px;
+                spacing: 8px;
+                Text {
+                    text: root.status;
+                    color: root.dark-mode ? white : #19242f;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
                 }
+                Button {
+                    text: "Retry";
+                    visible: root.can-retry;
+                    clicked => { root.retry(); }
+                }
+            }
+            Rectangle {
+                x: 12px;
+                y: 44px;
+                width: parent.width - 24px;
+                height: 9px;
+                background: #677381;
+                border-radius: 4px;
                 Rectangle {
-                    height: 9px;
-                    background: #677381;
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width * root.fraction;
+                    height: parent.height;
+                    background: #59baff;
                     border-radius: 4px;
-                    Rectangle {
-                        // Slint centers implicitly positioned children. Anchor the
-                        // fill at the left edge so progress grows left-to-right.
-                        x: 0px;
-                        y: 0px;
-                        width: parent.width * root.fraction;
-                        height: parent.height;
-                        background: #59baff;
-                        border-radius: 4px;
-                    }
-                    TouchArea {
-                        clicked => {
-                            root.seek-to(self.mouse-x / self.width);
-                        }
-                    }
                 }
-                HorizontalBox {
-                    spacing: 10px;
-                    Button {
-                        enabled: root.has-media;
-                        text: root.paused ? "Play" : "Pause";
-                        clicked => { root.toggle-pause(); }
-                    }
-                    Button {
-                        enabled: root.has-media;
-                        text: "-10 s";
-                        clicked => { root.seek-by(-10); }
-                    }
-                    Button {
-                        enabled: root.has-media;
-                        text: "+10 s";
-                        clicked => { root.seek-by(10); }
-                    }
-                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Button {
-                        text: "Fullscreen";
-                        clicked => { root.toggle-fullscreen(); }
-                    }
+                TouchArea {
+                    clicked => { root.seek-to(self.mouse-x / self.width); }
+                }
+            }
+            HorizontalBox {
+                x: 12px;
+                y: 63px;
+                width: parent.width - 24px;
+                height: 42px;
+                spacing: 10px;
+                Button {
+                    enabled: root.has-media;
+                    text: root.paused ? "Play" : "Pause";
+                    clicked => { root.toggle-pause(); }
+                }
+                Button {
+                    enabled: root.has-media;
+                    text: "-10 s";
+                    clicked => { root.seek-by(-10); }
+                }
+                Button {
+                    enabled: root.has-media;
+                    text: "+10 s";
+                    clicked => { root.seek-by(10); }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button {
+                    text: "Fullscreen";
+                    clicked => { root.toggle-fullscreen(); }
                 }
             }
         }
