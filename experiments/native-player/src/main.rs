@@ -7,7 +7,7 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_playback_streams, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
 
 slint::slint! {
@@ -47,6 +47,8 @@ slint::slint! {
         in-out property <bool> show-search: false;
         in-out property <string> search-status: "";
         in-out property <[SearchRow]> search-results;
+        in-out property <bool> has-more-results: false;
+        callback load-more();
         callback search(string);
         callback submit-input(string);
         callback open-result(string);
@@ -244,6 +246,7 @@ slint::slint! {
                     }
                 }
                 ListView {
+                    vertical-stretch: 1;
                     for hit in root.search-results : Rectangle {
                         width: parent.width;
                         height: 76px;
@@ -287,6 +290,11 @@ slint::slint! {
                         }
                         TouchArea { clicked => { root.open-result(hit.id); } }
                     }
+                }
+                Button {
+                    text: "Load more results";
+                    visible: root.has-more-results;
+                    clicked => { root.load-more(); }
                 }
             }
         }
@@ -407,14 +415,14 @@ type SearchResolution = Result<Vec<SearchHit>, String>;
 
 /// Search runs on its own worker. The current video keeps playing while
 /// yt-dlp reads a small, flat result list (no per-result video extraction).
-fn spawn_search(query: String, helper: PathBuf) -> Receiver<SearchResolution> {
+fn spawn_search(query: String, helper: PathBuf, count: usize) -> Receiver<SearchResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let response = (|| -> SearchResolution {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all().build().map_err(|_| "Could not initialize search runtime".to_string())?;
             runtime.block_on(async {
-                search_youtube(&query, &helper).await
+                search_youtube_with_limit(&query, &helper, count).await
                     .map_err(|error| format!("{} {}", error.message, error.action))
             })
         })();
@@ -509,6 +517,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     window.on_search(move |input| {
         *new_search.borrow_mut() = Some(input.to_string());
     });
+    let more_search_requested = Rc::new(RefCell::new(false));
+    let requested_more = more_search_requested.clone();
+    window.on_load_more(move || { *requested_more.borrow_mut() = true; });
     // Enter in the shared field follows its intent: URL -> watch, phrase ->
     // search. Explicit Open and Search buttons remain available to everyone.
     let enter_open = requested_url.clone();
@@ -650,6 +661,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
     let mut search_receiver: Option<Receiver<SearchResolution>> = None;
+    let mut active_search_query: Option<String> = None;
+    let mut search_count = SEARCH_BATCH_SIZE;
     let mut search_rows: Option<Rc<slint::VecModel<SearchRow>>> = None;
     let mut result_thumbnail_receivers: Vec<(usize, Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>>)> = Vec::new();
     let mut thumbnail_receiver: Option<Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>>> = None;
@@ -671,18 +684,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Old thumbnails may finish late; never attach to new search rows.
             result_thumbnail_receivers.clear();
             search_rows = None;
+            active_search_query = None;
+            search_count = SEARCH_BATCH_SIZE;
+            *more_search_requested.borrow_mut() = false;
             if let Some(ui) = label_window.upgrade() {
                 ui.set_show_search(true);
+                ui.set_has_more_results(false);
                 ui.set_search_results(slint::ModelRc::new(slint::VecModel::from(Vec::<SearchRow>::new())));
                 match validated_search_query(&query) {
                     Ok(clean) => {
                         ui.set_search_status("Searching YouTube...".into());
-                        search_receiver = Some(spawn_search(clean, helper.clone()));
+                        search_receiver = Some(spawn_search(clean.clone(), helper.clone(), search_count));
+                        active_search_query = Some(clean);
                     }
                     Err(error) => {
                         ui.set_search_status(error.message.into());
                         search_receiver = None;
                     }
+                }
+            }
+        }
+
+        if std::mem::take(&mut *more_search_requested.borrow_mut()) &&
+            search_receiver.is_none() && search_count < SEARCH_MAX_RESULTS
+        {
+            if let Some(ref query) = active_search_query {
+                search_count = (search_count + SEARCH_BATCH_SIZE).min(SEARCH_MAX_RESULTS);
+                search_receiver = Some(spawn_search(query.clone(), helper.clone(), search_count));
+                if let Some(ui) = label_window.upgrade() {
+                    ui.set_has_more_results(false);
+                    ui.set_search_status("Loading more results...".into());
                 }
             }
         }
@@ -699,22 +730,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     format!("{} video results", results.len())
                                 };
-                                let rows = results.iter().map(|hit| SearchRow {
-                                    id: hit.video_id.clone().into(),
-                                    title: hit.title.clone().into(),
-                                    details: search_result_details(hit).into(),
-                                    thumbnail: slint::Image::default(),
-                                    has_thumbnail: false,
+                                // ytsearchN re-fetches a longer prefix. Keep
+                                // already loaded thumbnails by stable video ID.
+                                let previous_images = search_rows.as_ref().map(|model| {
+                                    (0..model.row_count())
+                                        .filter_map(|index| model.row_data(index))
+                                        .map(|row| (row.id.to_string(), (row.thumbnail, row.has_thumbnail)))
+                                        .collect::<std::collections::HashMap<_, _>>()
+                                }).unwrap_or_default();
+                                result_thumbnail_receivers.clear();
+                                let mut pending_thumbnails = Vec::new();
+                                let rows = results.iter().enumerate().map(|(index, hit)| {
+                                    let (thumbnail, has_thumbnail) = previous_images
+                                        .get(&hit.video_id).cloned()
+                                        .unwrap_or((slint::Image::default(), false));
+                                    if !has_thumbnail {
+                                        pending_thumbnails.push((index, spawn_thumbnail(hit.video_id.clone())));
+                                    }
+                                    SearchRow {
+                                        id: hit.video_id.clone().into(),
+                                        title: hit.title.clone().into(),
+                                        details: search_result_details(hit).into(),
+                                        thumbnail,
+                                        has_thumbnail,
+                                    }
                                 }).collect::<Vec<_>>();
                                 let model = Rc::new(slint::VecModel::from(rows));
                                 ui.set_search_results(model.clone().into());
                                 search_rows = Some(model);
-                                result_thumbnail_receivers = results.iter().enumerate()
-                                    .map(|(index, hit)| (index, spawn_thumbnail(hit.video_id.clone())))
-                                    .collect();
+                                result_thumbnail_receivers = pending_thumbnails;
+                                ui.set_has_more_results(
+                                    results.len() >= search_count && search_count < SEARCH_MAX_RESULTS
+                                );
                                 ui.set_search_status(status.into());
                             }
-                            Err(error) => ui.set_search_status(format!("Search failed: {error}").into()),
+                            Err(error) => {
+                                ui.set_search_status(format!("Search failed: {error}").into());
+                                // Keep previous results when loading more fails.
+                                ui.set_has_more_results(
+                                    search_rows.is_some() && search_count < SEARCH_MAX_RESULTS
+                                );
+                            }
                         }
                     }
                 }
@@ -756,6 +812,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
                     *pending_seek_timing.borrow_mut() = None;
                     search_receiver = None;
+                    active_search_query = None;
+                    search_count = SEARCH_BATCH_SIZE;
                     search_rows = None;
                     result_thumbnail_receivers.clear();
                     if let Some(ui) = label_window.upgrade() { ui.set_show_search(false); }
