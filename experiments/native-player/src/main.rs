@@ -8,7 +8,7 @@ use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract_playback, HttpPlaybackHeaders, Provider};
-use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, select_muxed_stream, PlaybackAction};
+use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, PlaybackAction, WatchMetadata};
 
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox, LineEdit, Palette } from "std-widgets.slint";
@@ -28,6 +28,13 @@ slint::slint! {
         in-out property <bool> has-url: false;
         in-out property <bool> has-media: false;
         in-out property <bool> dark-mode: Palette.color-scheme == ColorScheme.dark;
+        in-out property <bool> has-video-info: false;
+        in-out property <string> video-title: "";
+        in-out property <string> video-subtitle: "";
+        in-out property <image> video-thumbnail;
+        in-out property <bool> has-thumbnail: false;
+        in-out property <bool> can-retry: false;
+        callback retry();
         callback open-url(string);
         callback open-browser();
         callback toggle-pause();
@@ -74,6 +81,43 @@ slint::slint! {
             }
         }
 
+        // Read-only details above the native video surface; image data arrives
+        // asynchronously and only from the public YouTube thumbnail origin.
+        Rectangle {
+            x: 0px;
+            y: 64px;
+            width: parent.width;
+            height: 54px;
+            visible: root.has-video-info;
+            background: root.dark-mode ? #d51b202b : #edf1f5;
+            HorizontalBox {
+                padding: 8px;
+                spacing: 10px;
+                Image {
+                    source: root.video-thumbnail;
+                    visible: root.has-thumbnail;
+                    width: 64px;
+                    height: 36px;
+                    image-fit: contain;
+                }
+                Text {
+                    text: root.video-title;
+                    color: root.dark-mode ? white : #19242f;
+                    font-size: 15px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.video-subtitle;
+                    color: root.dark-mode ? #d2d7e2 : #34485e;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+
         // The transparent window is deliberate: libmpv draws the GL underlay
         // before Slint paints these controls over it.
         Rectangle {
@@ -85,11 +129,21 @@ slint::slint! {
             VerticalBox {
                 padding: 10px;
                 spacing: 9px;
-                Text {
-                    text: root.status;
-                    color: root.dark-mode ? white : #19242f;
-                    font-size: 13px;
-                    vertical-alignment: center;
+                HorizontalBox {
+                    spacing: 8px;
+                    Text {
+                        text: root.status;
+                        color: root.dark-mode ? white : #19242f;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Button {
+                        text: "Retry";
+                        visible: root.can-retry;
+                        clicked => { root.retry(); }
+                    }
                 }
                 Rectangle {
                     height: 9px;
@@ -147,7 +201,7 @@ fn time_label(seconds: f64) -> String {
 #[derive(Debug)]
 struct ResolvedStream {
     url: String,
-    title: String,
+    watch: WatchMetadata,
     provider: Provider,
     headers: HttpPlaybackHeaders,
     extraction_ms: u128,
@@ -176,11 +230,54 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 let headers = stream.http_headers.clone();
                 Ok(ResolvedStream {
                     url: media_url,
-                    title: info.title,
+                    watch: present_watch_metadata(&info),
                     provider,
                     headers,
                     extraction_ms: extraction_started.elapsed().as_millis(),
                 })
+            })
+        })();
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+/// Public, fixed-origin thumbnail fetch on a separate worker. It never blocks
+/// media extraction or the Slint UI thread and never follows cross-origin redirects.
+/// Reject oversized responses without reading the complete payload into memory.
+fn spawn_thumbnail(video_id: String) -> Receiver<Option<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Option<Vec<u8>> {
+            let url = public_youtube_thumbnail_url(&video_id)?;
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+            runtime.block_on(async {
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(6)).build().ok()?;
+                let mut response = client.get(&url).send().await.ok()?;
+                if !response.status().is_success() { return None; }
+                let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)?
+                    .to_str().ok()?;
+                if !content_type.starts_with("image/jpeg") && !content_type.starts_with("image/png") {
+                    return None;
+                }
+                const MAX_BYTES: usize = 512 * 1024;
+                if response.content_length().is_some_and(|len| len > MAX_BYTES as u64) {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if chunk.len() > MAX_BYTES - bytes.len() { return None; }
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(_) => return None,
+                    }
+                }
+                (!bytes.is_empty()).then_some(bytes)
             })
         })();
         let _ = sender.send(result);
@@ -272,6 +369,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
+    // Retry uses the same canonical URL and worker path as a normal Open.
+    let retry_request = requested_url.clone();
+    let retry_url = browser_url.clone();
+    window.on_retry(move || {
+        if let Some(url) = retry_url.borrow().clone() {
+            *retry_request.borrow_mut() = Some(url);
+        }
+    });
 
     let clip_source = Rc::new(RefCell::new(clip));
     let player = Rc::new(RefCell::new(Player::open()?));
@@ -348,6 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label_player = player.clone();
     let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
+    let mut thumbnail_receiver: Option<Receiver<Option<Vec<u8>>>> = None;
     let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
     let mut resolving = receiver.is_some();
@@ -379,6 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *browser_url.borrow_mut() = Some(canonical.clone());
                     clip_source.borrow_mut().take();
                     media_title = None;
+                    thumbnail_receiver = None;
                     playback_error = None;
                     load_started = None;
                     file_loaded = false;
@@ -388,12 +495,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_url(true);
                         ui.set_has_media(false);
+                        ui.set_has_video_info(false);
+                        ui.set_has_thumbnail(false);
+                        ui.set_video_thumbnail(slint::Image::default());
+                        ui.set_can_retry(false);
                         ui.set_url_text(canonical.into());
                         ui.set_fraction(0.0);
                     }
                 }
                 Err(error) => {
                     playback_error = Some(format!("{} {}", error.message, error.action));
+                    if let Some(ui) = label_window.upgrade() { ui.set_can_retry(false); }
                 }
             }
         }
@@ -470,6 +582,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Late responses from a superseded video are discarded with its receiver.
+        // Decode small JPEG/PNG thumbnails only after they reach the UI thread.
+        if let Some(rx) = thumbnail_receiver.as_ref() {
+            match rx.try_recv() {
+                Ok(Some(bytes)) => {
+                    if let Some(ui) = label_window.upgrade() {
+                        if let Ok(image) = slint::Image::load_from_data(&bytes, None) {
+                            ui.set_video_thumbnail(image);
+                            ui.set_has_thumbnail(true);
+                        }
+                    }
+                    thumbnail_receiver = None;
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => thumbnail_receiver = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
         if let Some(response) = pending.take() {
             let ready = { label_player.borrow().is_render_ready() };
             if !ready {
@@ -483,7 +613,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if profile_timings {
                             eprintln!("[yt-lite] timing {}-extract={}ms", provider_label(stream.provider), stream.extraction_ms);
                         }
-                        media_title = Some(stream.title);
+                        media_title = Some(stream.watch.title.clone());
+                        if let Some(ui) = label_window.upgrade() {
+                            ui.set_video_title(stream.watch.title.clone().into());
+                            ui.set_video_subtitle(stream.watch.subtitle.clone().into());
+                            ui.set_has_video_info(true);
+                            ui.set_can_retry(false);
+                        }
+                        if stream.watch.thumbnail_url.is_some() {
+                            // The watch metadata contains only a validated public ID.
+                            if let Ok((id, _)) = canonical_video_url(remote_url.as_deref().unwrap_or("")) {
+                                thumbnail_receiver = Some(spawn_thumbnail(id));
+                            }
+                        }
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
                         match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
                             Ok(()) => {
@@ -513,6 +655,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending = None;
                     resolving = true;
                     media_title = None;
+                    thumbnail_receiver = None;
                     load_started = None;
                     file_loaded = false;
                     file_loaded_at = None;
@@ -520,6 +663,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     has_network_media = false;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_media(false);
+                        ui.set_can_retry(false);
+                        ui.set_has_video_info(false);
+                        ui.set_has_thumbnail(false);
                     }
                 } else {
                     playback_error = Some(err);
@@ -532,6 +678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 file_loaded_at = None;
                 if let Some(ui) = label_window.upgrade() {
                     ui.set_has_media(false);
+                    ui.set_can_retry(remote_url.is_some());
                 }
             }
         }
