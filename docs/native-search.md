@@ -56,7 +56,7 @@ play it in the **same** libmpv session. Use **Close** to dismiss search.
   responses are discarded when a new search or video open supersedes them.
 - Offline root tests verify parsing, input validation, empty and malformed
   responses. CI does **not** contact YouTube.
-- Full search filters, results thumbnails, paging, provider fallback,
+- Full search filters, paging, provider fallback,
   accessibility review and polished responsive layout remain open before
   #7 acceptance. Public yt-dlp search availability is not guaranteed
   because YouTube's external behavior changes.
@@ -64,3 +64,71 @@ play it in the **same** libmpv session. Use **Close** to dismiss search.
 For performance, see [issue #30](https://github.com/rteats/yt-lite/issues/30).
 The experimentally reduced `--lean-metadata` flag is optional;
 normal playback continues to use complete extraction.
+
+
+## Windows screenshot and playback feedback — 2026-11-23
+
+The user confirmed the native watch metadata (title, channel, duration,
+thumbnail), the search results panel, and the ability to search/open/search
+again without stopping the current video. They identified three gaps:
+
+1. At 150% DPI, the bottom transport buttons were partially off-screen.
+   The original `preferred-height: 640px` window plus taskbar and window
+   decorations made the default window too tall for a 1080p screen.
+   Controls were also positioned in a stretching vertical layout.
+2. The libmpv video image filled the full window behind the 64px header,
+   optional 54px metadata row and 106px bottom panel instead of fitting
+   **between** the chrome.
+3. Search results did not display thumbnail images. The first result
+   attempted to play but neither provider returned a *muxed* stream;
+   the current selector rejected all separate video/audio formats.
+   The user subsequently confirmed successful playback of other results.
+
+### Follow-up implementation on the search branch
+
+- Default window height reduced to **560 logical px** and min-height
+  raised to **480 logical px**; bottom controls now occupy a fixed
+  116px panel with explicit rows and spacing. Window resizing and
+  fullscreen remain enabled.
+- libmpv uses dynamic `video-margin-ratio-top/bottom` properties to
+  letterbox the video into the unobscured center, preserving its aspect
+  ratio. Ratios convert Slint logical pixel values using the current
+  per-window DPI scale and physical height; resizing, fullscreen and
+  metadata visibility are handled. Failure logs only once.
+- Search results now fetch public fixed-origin YouTube JPEG thumbnails
+  on separate workers using the existing 512KiB response limit and
+  1024×1024 decoded-size limit, then pass image pixels to the native
+  list model. Stale responses cannot change newer search rows.
+- The player still **prefers muxed HTTP(S) audio/video** formats.
+  When none exists, it can select one video-only and one audio-only
+  HTTP(S) format with matching request headers, load video, then use
+  libmpv's `audio-add` command to attach the audio track inside the
+  same session. No FFmpeg mux, separate decoder window, or media
+  download occurs. An external-audio command error is actionable.
+  End-to-end audible-audio and seek sync still require Windows testing.
+
+The format selector and video margin calculations have deterministic
+offline tests. See [draft PR #32](https://github.com/rteats/yt-lite/pull/32).
+The separate-track capability also informs the later quality-selection
+ticket [#10](https://github.com/rteats/yt-lite/issues/10); this is not
+a full implementation of quality/codec selection.
+
+### New Windows smoke test
+
+```powershell
+git switch feat/youtube-search-07
+git pull --ff-only
+cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets
+cargo build --release --manifest-path experiments/native-player/Cargo.toml
+$helper = (Get-Command yt-dlp).Source
+& ".\experiments\native-player\target\release\yt-lite-native-player-proof.exe" --provider auto --yt-dlp $helper --timings
+```
+
+Verify that transport buttons remain completely visible at 150% DPI
+(initial size and maximized), no part of the video is covered by
+top/bottom chrome, and search results load thumbnails. For a video
+which used to fail with `No combined audio+video HTTP stream`, verify
+**visible video, audible audio and audio/video sync after seeking**.
+Also test changing search results repeatedly. The split-stream fallback
+is new and has not yet been verified against a real YouTube video.
+
