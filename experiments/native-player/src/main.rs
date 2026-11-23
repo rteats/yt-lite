@@ -24,7 +24,8 @@ slint::slint! {
     export component PlayerWindow inherits Window {
         title: "yt-lite / watch";
         preferred-width: 1000px;
-        preferred-height: 640px;
+        // 560 logical px leaves room for window decorations/taskbar at 150% DPI.
+        preferred-height: 560px;
         min-width: 660px;
         min-height: 480px;
         background: transparent;
