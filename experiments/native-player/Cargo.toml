@@ -8,6 +8,8 @@ publish = false
 slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg"] }
 libloading = "0.8"
 webbrowser = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 yt-lite-extraction-proof = { path = "../.." }
 tokio = { version = "1", features = ["rt", "time"] }
 
