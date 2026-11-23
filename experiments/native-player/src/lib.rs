@@ -71,11 +71,11 @@ pub fn select_playback_streams(
     let video = streams.iter().filter(|s| s.has_video && !s.has_audio)
         .filter(http)
         .max_by_key(|s| (s.height.unwrap_or(0), s.width.unwrap_or(0)))?;
+    // mpv's request headers currently apply to both inputs. Do not pair
+    // streams that require incompatible referrers or User-Agent values.
     let audio = streams.iter().filter(|s| s.has_audio && !s.has_video)
         .filter(http)
-        .find(|s| s.http_headers == video.http_headers)
-        .or_else(|| streams.iter().filter(|s| s.has_audio && !s.has_video)
-            .filter(http).next())?;
+        .find(|s| s.http_headers == video.http_headers)?;
     Some(PlaybackStreamSelection::Separate { video, audio })
 }
 
