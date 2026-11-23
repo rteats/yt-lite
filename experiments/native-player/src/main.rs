@@ -770,7 +770,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_search_results(model.clone().into());
                                 search_rows = Some(model);
                                 result_thumbnail_receivers = pending_thumbnails;
-                                ui.set_has_more_results(page.has_more);
+                                // Flat YouTube search can return fewer
+                                // *usable* entries than requested. Allow one
+                                // explicit expansion from the initial prefix
+                                // even when the provider reports a short page.
+                                // Subsequent batches respect provider exhaustion.
+                                ui.set_has_more_results(
+                                    page.has_more ||
+                                    (search_count == SEARCH_BATCH_SIZE && !results.is_empty())
+                                );
                                 ui.set_search_status(status.into());
                             }
                             Err(error) => {
