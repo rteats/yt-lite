@@ -80,3 +80,47 @@ pub fn fallback_after_playback_error(
         _ => None,
     }
 }
+
+/// Metadata the native watch page can display before the decoder starts.
+/// Does not contain signed stream URLs, credentials, or extractor JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchMetadata {
+    pub title: String,
+    pub subtitle: String,
+    pub thumbnail_url: Option<String>,
+}
+
+/// Build a predictable public thumbnail URL from a validated YouTube ID.
+/// We never fetch an arbitrary URL returned by an extraction provider.
+pub fn public_youtube_thumbnail_url(id: &str) -> Option<String> {
+    if id.len() != 11 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return None;
+    }
+    Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
+}
+
+fn format_watch_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let mins = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins}:{secs:02}")
+    }
+}
+
+/// Present the same basic details for full and opt-in lean extraction.
+pub fn present_watch_metadata(info: &yt_lite_extraction_proof::ExtractionResult) -> WatchMetadata {
+    let duration = info.duration_seconds.map(format_watch_duration)
+        .unwrap_or_else(|| "Duration unavailable".into());
+    let subtitle = match info.channel.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(channel) => format!("{channel} · {duration}"),
+        None => duration,
+    };
+    WatchMetadata {
+        title: info.title.clone(),
+        subtitle,
+        thumbnail_url: public_youtube_thumbnail_url(&info.video_id),
+    }
+}
