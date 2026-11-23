@@ -5,7 +5,7 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
-use yt_lite_native_player_proof::NETWORK_STREAM_OPTIONS;
+use yt_lite_native_player_proof::{video_margin_ratios, NETWORK_STREAM_OPTIONS};
 use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
@@ -58,6 +58,8 @@ pub enum PlaybackEvent {
     FileLoaded,
     PlaybackRestart,
     LoadFailed(i32),
+    ExternalAudioAdded,
+    ExternalAudioFailed(i32),
     Ended,
 }
 
@@ -71,6 +73,7 @@ const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
 const LOADFILE_REPLY_ID: u64 = 0x594c_4f41_44;
+const EXTERNAL_AUDIO_REPLY_ID: u64 = 0x5941_5544_494f;
 
 #[derive(Clone, Copy)]
 struct Api {
@@ -163,6 +166,7 @@ pub struct Player {
     context: *mut c_void,
     wake: Option<Box<Wake>>,
     loaded: bool,
+    last_video_margins: Option<(u64, u64)>,
     _lib: Library,
 }
 
@@ -185,7 +189,7 @@ impl Player {
         let api = unsafe { Api::load(&lib)? };
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
-        let player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, _lib: lib };
+        let player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, last_video_margins: None, _lib: lib };
         // Network HTTP media is streamed through libmpv with bounded memory,
         // no disk cache, and no full-file download before playback.
         for (key, value) in [
@@ -268,6 +272,36 @@ impl Player {
         Ok(())
     }
 
+    /// Add a separate HTTP audio track after the video FILE_LOADED event.
+    /// The two network streams share compatible User-Agent / Referer headers.
+    /// This remains one mpv decoder session; no local download or muxing.
+    pub fn add_external_audio(&self, url: &str) -> Result<(), String> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err("Extractor returned a non-HTTP audio stream".into());
+        }
+        self.send_command(
+            &["audio-add".into(), url.into(), "select".into()],
+            EXTERNAL_AUDIO_REPLY_ID,
+        )
+    }
+
+    /// mpv renders to the full GL framebuffer; reserve Slint chrome as
+    /// margins so the *video picture* is confined to the visible center.
+    /// Avoid setting properties on every frame; update only on geometry/DPI
+    /// or when the video metadata row changes.
+    pub fn update_video_margins(
+        &mut self, height_px: u32, scale_factor: f32, has_metadata: bool,
+    ) -> Result<(), String> {
+        if height_px == 0 { return Ok(()); }
+        let (top, bottom) = video_margin_ratios(height_px, scale_factor, has_metadata);
+        let key = (top.to_bits(), bottom.to_bits());
+        if self.last_video_margins == Some(key) { return Ok(()); }
+        self.set_string_property(c"video-margin-ratio-top", &format!("{top:.7}"))?;
+        self.set_string_property(c"video-margin-ratio-bottom", &format!("{bottom:.7}"))?;
+        self.last_video_margins = Some(key);
+        Ok(())
+    }
+
     pub fn send_strings(&self, args: &[String]) -> Result<(), String> {
         self.send_command(args, 0)
     }
@@ -300,6 +334,13 @@ impl Player {
                 MPV_EVENT_PLAYBACK_RESTART => events.push(PlaybackEvent::PlaybackRestart),
                 MPV_EVENT_COMMAND_REPLY if event.reply_userdata == LOADFILE_REPLY_ID && event.error < 0 => {
                     events.push(PlaybackEvent::LoadFailed(event.error));
+                }
+                MPV_EVENT_COMMAND_REPLY if event.reply_userdata == EXTERNAL_AUDIO_REPLY_ID => {
+                    if event.error < 0 {
+                        events.push(PlaybackEvent::ExternalAudioFailed(event.error));
+                    } else {
+                        events.push(PlaybackEvent::ExternalAudioAdded);
+                    }
                 }
                 MPV_EVENT_END_FILE if !event.data.is_null() => {
                     let end = unsafe { &*event.data.cast::<MpvEndFile>() };
