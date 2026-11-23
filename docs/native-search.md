@@ -90,11 +90,14 @@ again without stopping the current video. They identified three gaps:
   raised to **480 logical px**; bottom controls now occupy a fixed
   116px panel with explicit rows and spacing. Window resizing and
   fullscreen remain enabled.
-- libmpv uses dynamic `video-margin-ratio-top/bottom` properties to
-  letterbox the video into the unobscured center, preserving its aspect
-  ratio. Ratios convert Slint logical pixel values using the current
-  per-window DPI scale and physical height; resizing, fullscreen and
-  metadata visibility are handled. Failure logs only once.
+- libmpv uses dynamic `video-margin-ratio-top/bottom/right` properties to
+  letterbox the video into the unobscured center/left area, preserving
+  its aspect ratio. When search results open, the right margin also
+  reserves space for the 350px results panel, instead of covering the
+  picture. Ratios convert Slint logical pixel values using the current
+  per-window DPI scale and physical dimensions; resizing, fullscreen,
+  search visibility and metadata visibility are handled. Failure logs
+  only once.
 - Search results now fetch public fixed-origin YouTube JPEG thumbnails
   on separate workers using the existing 512KiB response limit and
   1024×1024 decoded-size limit, then pass image pixels to the native
