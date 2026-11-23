@@ -177,3 +177,13 @@ pub fn present_watch_metadata(info: &yt_lite_extraction_proof::ExtractionResult)
         thumbnail_url: public_youtube_thumbnail_url(&info.video_id),
     }
 }
+
+/// Search results occupy the right 350 logical px plus a 10px gap.
+/// Constrain the viewport margin at small window widths.
+pub fn search_margin_ratio(width_px: u32, scale_factor: f32, show_search: bool) -> f64 {
+    if !show_search || width_px == 0 { return 0.0; }
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        f64::from(scale_factor)
+    } else { 1.0 };
+    (370.0 * scale / f64::from(width_px)).min(0.65)
+}
