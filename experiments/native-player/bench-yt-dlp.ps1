@@ -5,7 +5,8 @@
 param(
     [string] $Url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     [string] $YtDlp = "",
-    [ValidateRange(1, 5)] [int] $Repetitions = 2
+    [ValidateRange(1, 5)] [int] $Repetitions = 2,
+    [switch] $ManifestOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +28,17 @@ $variants = @(
     @{ Name = "skip_translated_subs"; Extra = @("--extractor-args", "youtube:skip=translated_subs") },
     @{ Name = "skip_manifests"; Extra = @("--extractor-args", "youtube:skip=hls,dash,translated_subs") }
 )
+if ($ManifestOnly) {
+    # Isolate which manifest family might account for extra post-announcement
+    # time. These are diagnostic variants only, never playback defaults.
+    $variants = @(
+        @{ Name = "baseline"; Extra = @() },
+        @{ Name = "skip_hls"; Extra = @("--extractor-args", "youtube:skip=hls") },
+        @{ Name = "skip_dash"; Extra = @("--extractor-args", "youtube:skip=dash") },
+        @{ Name = "skip_hls_dash"; Extra = @("--extractor-args", "youtube:skip=hls,dash") }
+    )
+}
+
 $common = @(
     "--ignore-config", "--no-playlist", "--no-warnings",
     "--skip-download", "--dump-single-json",
@@ -34,7 +46,13 @@ $common = @(
 )
 
 for ($round = 1; $round -le $Repetitions; $round++) {
-    foreach ($variant in $variants) {
+    # A balanced reverse order in successive rounds reduces fixed-order
+    # cache/warmup bias without changing the conditions being compared.
+    $roundVariants = @($variants)
+    if ($ManifestOnly -and ($round % 2 -eq 0)) {
+        [array]::Reverse($roundVariants)
+    }
+    foreach ($variant in $roundVariants) {
         $argsList = @($common) + @($variant.Extra) + @("--", $Url)
         $timer = [Diagnostics.Stopwatch]::StartNew()
 
