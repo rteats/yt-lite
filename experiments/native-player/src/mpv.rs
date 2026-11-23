@@ -5,7 +5,7 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
-use yt_lite_native_player_proof::{video_margin_ratios, NETWORK_STREAM_OPTIONS};
+use yt_lite_native_player_proof::{search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
 use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
@@ -166,7 +166,7 @@ pub struct Player {
     context: *mut c_void,
     wake: Option<Box<Wake>>,
     loaded: bool,
-    last_video_margins: Option<(u64, u64)>,
+    last_video_margins: Option<(u64, u64, u64)>,
     _lib: Library,
 }
 
@@ -290,14 +290,17 @@ impl Player {
     /// Avoid setting properties on every frame; update only on geometry/DPI
     /// or when the video metadata row changes.
     pub fn update_video_margins(
-        &mut self, height_px: u32, scale_factor: f32, has_metadata: bool,
+        &mut self, width_px: u32, height_px: u32, scale_factor: f32,
+        has_metadata: bool, show_search: bool,
     ) -> Result<(), String> {
-        if height_px == 0 { return Ok(()); }
+        if width_px == 0 || height_px == 0 { return Ok(()); }
         let (top, bottom) = video_margin_ratios(height_px, scale_factor, has_metadata);
-        let key = (top.to_bits(), bottom.to_bits());
+        let right = search_margin_ratio(width_px, scale_factor, show_search);
+        let key = (top.to_bits(), bottom.to_bits(), right.to_bits());
         if self.last_video_margins == Some(key) { return Ok(()); }
         self.set_string_property(c"video-margin-ratio-top", &format!("{top:.7}"))?;
         self.set_string_property(c"video-margin-ratio-bottom", &format!("{bottom:.7}"))?;
+        self.set_string_property(c"video-margin-ratio-right", &format!("{right:.7}"))?;
         self.last_video_margins = Some(key);
         Ok(())
     }
