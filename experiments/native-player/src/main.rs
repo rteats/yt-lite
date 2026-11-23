@@ -41,6 +41,7 @@ slint::slint! {
         in-out property <string> search-status: "";
         in-out property <[SearchRow]> search-results;
         callback search(string);
+        callback submit-input(string);
         callback open-result(string);
         callback close-search();
         callback open-url(string);
@@ -70,8 +71,8 @@ slint::slint! {
                 LineEdit {
                     horizontal-stretch: 1;
                     text <=> root.url-text;
-                    placeholder-text: "Paste video URL or enter search terms...";
-                    accepted(text) => { root.open-url(text); }
+                    placeholder-text: "Paste video URL or search phrase (Enter)...";
+                    accepted(text) => { root.submit-input(text); }
                 }
                 Button {
                     text: "Open";
@@ -473,6 +474,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let new_search = search_requested.clone();
     window.on_search(move |input| {
         *new_search.borrow_mut() = Some(input.to_string());
+    });
+    // Enter in the shared field follows its intent: URL -> watch, phrase ->
+    // search. Explicit Open and Search buttons remain available to everyone.
+    let enter_open = requested_url.clone();
+    let enter_search = search_requested.clone();
+    window.on_submit_input(move |input| {
+        let value = input.to_string();
+        if value.starts_with("http://") || value.starts_with("https://")
+            || value.contains("youtube.com/") || value.contains("youtu.be/")
+        {
+            *enter_open.borrow_mut() = Some(value);
+        } else {
+            *enter_search.borrow_mut() = Some(value);
+        }
     });
 
     let result_request = requested_url.clone();
