@@ -85,7 +85,7 @@ pub fn select_playback_streams(
         })
         .max_by_key(|(video, _)| {
             let height = video.height.unwrap_or(0);
-            (height <= AUTO_PREFERRED_MAX_HEIGHT, height, video.width.unwrap_or(0))
+            (height > 0 && height <= AUTO_PREFERRED_MAX_HEIGHT, height, video.width.unwrap_or(0))
         });
     match (muxed, split) {
         (Some(muxed), Some((video, audio)))
