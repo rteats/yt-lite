@@ -7,7 +7,7 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, select_playback_streams, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
 
 slint::slint! {
@@ -420,7 +420,7 @@ fn spawn_thumbnail(video_id: String) -> Receiver<Option<slint::SharedPixelBuffer
     receiver
 }
 
-type SearchResolution = Result<Vec<SearchHit>, String>;
+type SearchResolution = Result<SearchPage, String>;
 
 /// Search runs on its own worker. The current video keeps playing while
 /// yt-dlp reads a small, flat result list (no per-result video extraction).
@@ -734,7 +734,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     search_receiver = None;
                     if let Some(ui) = label_window.upgrade() {
                         match response {
-                            Ok(results) => {
+                            Ok(page) => {
+                                let results = page.hits;
                                 let status = if results.is_empty() {
                                     "No videos found.".to_string()
                                 } else {
@@ -769,9 +770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_search_results(model.clone().into());
                                 search_rows = Some(model);
                                 result_thumbnail_receivers = pending_thumbnails;
-                                ui.set_has_more_results(
-                                    results.len() >= search_count && search_count < SEARCH_MAX_RESULTS
-                                );
+                                ui.set_has_more_results(page.has_more);
                                 ui.set_search_status(status.into());
                             }
                             Err(error) => {
