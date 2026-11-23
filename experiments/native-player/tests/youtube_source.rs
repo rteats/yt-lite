@@ -169,3 +169,19 @@ fn incompatible_headers_on_top_track_do_not_hide_compatible_lower_track() {
         Some(PlaybackStreamSelection::Separate { video, audio })
         if video.format_id == "v720" && audio.format_id == "a"));
 }
+
+#[test]
+fn unknown_video_height_does_not_outrank_known_hd_video() {
+    use yt_lite_native_player_proof::{select_playback_streams, PlaybackStreamSelection};
+    let json = r#"{
+        "id":"dQw4w9WgXcQ","title":"Fixture",
+        "formats":[
+            {"format_id":"unknown","url":"https://cdn.example.test/u","vcodec":"vp9","acodec":"none"},
+            {"format_id":"hd","url":"https://cdn.example.test/h","height":1440,"vcodec":"vp9","acodec":"none"},
+            {"format_id":"audio","url":"https://cdn.example.test/a","vcodec":"none","acodec":"opus"}
+        ]
+    }"#;
+    let info = parse_provider_json(Provider::YtDlp, ID, json).unwrap();
+    assert!(matches!(select_playback_streams(&info),
+        Some(PlaybackStreamSelection::Separate { video, .. }) if video.format_id == "hd"));
+}
