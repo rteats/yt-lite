@@ -445,6 +445,86 @@ tests before adoption.
 
 Track results in [issue #30](https://github.com/rteats/yt-lite/issues/30).
 
+## JSON output projection: Windows A/B and opt-in playback experiment (2026-11-23)
+
+The user measured all three yt-dlp JSON output variants on two public videos,
+with two rounds per video. Extraction times include the subprocess and
+collection of stdout. `ParseMs` is **PowerShell** `ConvertFrom-Json` time,
+not the native Rust JSON parsing cost.
+
+| Mean (two runs) | `dQw4w9WgXcQ` | `fq-Xn7ZOZtg` |
+| --- | ---: | ---: |
+| Full JSON extraction | 6,223.5 ms | 8,453 ms |
+| Formats-only extraction | 6,541 ms | 7,731.5 ms |
+| Full output size | ~657 KiB | ~11,122 KiB |
+| Formats-only output size | ~121 KiB | ~115 KiB |
+| Full PowerShell JSON parsing | ~50 ms | ~979 ms |
+| Formats-only PowerShell JSON parsing | ~30 ms | ~9 ms |
+
+All parsed variants retained the **same 43 media formats, muxed
+audio/video availability and matching safe format fingerprints**.
+The full second-video JSON was roughly **11 MiB**, largely associated
+with its 23,114 automatic-caption format entries.
+
+For the second video, formats-only output reduced measured extraction
+time by approximately **722 ms**, while the original video became
+**318 ms slower**. The output reduction may benefit Rust memory/parse
+overhead, but no consistent *extraction* improvement is established
+from two trials. The similarly large `formats_captions` output was
+not consistently slower than full output, which reinforces the
+importance of measuring actual end-to-end behavior.
+
+### Opt-in native playback experiment
+
+The native watch shell now accepts `--lean-metadata`, **off by
+default**. For yt-dlp this replaces `--dump-single-json` with
+yt-dlp's output-template JSON projection including `id`, `title`,
+`duration`, `thumbnail`, `channel`, root `http_headers` and
+the **complete `formats` array**. It still performs normal yt-dlp
+network extraction, with HLS/DASH manifest discovery and incremental
+libmpv HTTP streaming. No video download is introduced.
+
+The existing `extract()` API, root CLI and complete capability
+extraction remain unchanged. The opt-in API reports captions and
+chapters as **Unknown**, not Unavailable. The native watch shell
+currently uses only the title and selected muxed stream to start
+playback; future subtitle/chapters UI must request the full metadata
+when needed. The Rust provider is unchanged by this option.
+
+Build once, then compare the same two video URLs in separate runs:
+
+```powershell
+git switch feat/native-watch-shell-05
+git pull --ff-only
+cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets
+cargo build --release --manifest-path experiments/native-player/Cargo.toml
+
+$player = ".\experiments\native-player\target\release\yt-lite-native-player-proof.exe"
+$helper = (Get-Command yt-dlp -ErrorAction Stop).Source
+
+# Baseline: full extraction, existing proven playback
+& $player --provider yt-dlp --yt-dlp $helper --timings
+
+# Experiment: smaller JSON output, same stream selection
+& $player --provider yt-dlp --yt-dlp $helper --timings --lean-metadata
+```
+
+For each run paste a public URL into the watch bar. Compare
+`timing yt-dlp-extract=...ms` and `timing libmpv-load=...ms`
+over two videos, ideally reversing the full/lean order on the second
+pass. Verify video, audible audio, seeking and the loaded title,
+not just extractor success. Test whether reducing JSON parsing
+matters more for the 11-MiB second video. The `--timings` log
+contains no signed media URLs.
+
+**Safety/quality gate:** retain the full output as the default until
+the Windows A/B confirms a repeatable startup improvement without
+loss of playback/format compatibility. There is no promise that
+removing fields from stdout speeds up YouTube's underlying requests
+or JS challenge solving.
+
+See [issue #30](https://github.com/rteats/yt-lite/issues/30).
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
