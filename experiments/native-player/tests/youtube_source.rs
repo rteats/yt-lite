@@ -89,7 +89,7 @@ fn falls_back_to_separate_video_and_audio_when_no_muxed_stream_exists() {
 }
 
 #[test]
-fn muxed_stream_stays_first_choice_and_incomplete_pair_is_rejected() {
+fn higher_quality_split_stream_is_preferred_but_incomplete_pair_is_rejected() {
     use yt_lite_native_player_proof::{select_playback_streams, PlaybackStreamSelection};
     let fixture = |formats: &str| {
         parse_provider_json(Provider::YtDlp, ID, &format!(
@@ -101,7 +101,10 @@ fn muxed_stream_stays_first_choice_and_incomplete_pair_is_rejected() {
            {"format_id":"137","url":"https://example.test/video","vcodec":"avc1","acodec":"none","height":1080},
            {"format_id":"140","url":"https://example.test/audio","vcodec":"none","acodec":"mp4a"}"#
     );
-    assert!(matches!(select_playback_streams(&muxed), Some(PlaybackStreamSelection::Muxed(_))));
+    assert!(matches!(select_playback_streams(&muxed),
+        Some(PlaybackStreamSelection::Separate { video, audio })
+        if video.format_id == "137" && audio.format_id == "140"
+    ));
     let no_audio = fixture(
         r#"{"format_id":"137","url":"https://example.test/video","vcodec":"avc1","acodec":"none"}"#
     );
@@ -126,4 +129,43 @@ fn search_sidebar_reserves_right_side_without_obscuring_video() {
     assert_eq!(search_margin_ratio(1500, 1.5, false), 0.0);
     assert!((search_margin_ratio(1500, 1.5, true) - 0.37).abs() < 0.001);
     assert!(search_margin_ratio(400, 2.0, true) <= 0.65);
+}
+
+#[test]
+fn auto_quality_prefers_1080p_split_over_360p_but_keeps_muxed_for_equal_quality() {
+    use yt_lite_native_player_proof::{select_playback_streams, PlaybackStreamSelection};
+    let fixture = |heights: &[u64]| {
+        let mut formats = vec![
+            r#"{"format_id":"18","url":"https://cdn.example.test/mux","height":360,"vcodec":"avc1","acodec":"mp4a"}"#.to_string(),
+            r#"{"format_id":"140","url":"https://cdn.example.test/aud","vcodec":"none","acodec":"mp4a"}"#.to_string(),
+        ];
+        for h in heights {
+            formats.push(format!(r#"{{"format_id":"v{h}","url":"https://cdn.example.test/v{h}","height":{h},"vcodec":"vp9","acodec":"none"}}"#));
+        }
+        parse_provider_json(Provider::YtDlp, ID, &format!(r#"{{"id":"{ID}","title":"Fixture","formats":[{}]}}"#,formats.join(","))).unwrap()
+    };
+    let full = fixture(&[720, 1080, 1440, 2160]);
+    assert!(matches!(select_playback_streams(&full),
+        Some(PlaybackStreamSelection::Separate { video, .. }) if video.height == Some(1080)));
+    let equal = fixture(&[240, 360]);
+    assert!(matches!(select_playback_streams(&equal),
+        Some(PlaybackStreamSelection::Muxed(stream)) if stream.height == Some(360)));
+}
+
+#[test]
+fn incompatible_headers_on_top_track_do_not_hide_compatible_lower_track() {
+    use yt_lite_native_player_proof::{select_playback_streams, PlaybackStreamSelection};
+    let doc = r#"{
+        "id":"dQw4w9WgXcQ", "title":"Fixture",
+        "formats":[
+            {"format_id":"18","url":"https://cdn.example.test/mux","height":360,"vcodec":"avc1","acodec":"mp4a"},
+            {"format_id":"v1080","url":"https://cdn.example.test/v1080","height":1080,"vcodec":"vp9","acodec":"none","http_headers":{"Referer":"https://other.example/"}},
+            {"format_id":"v720","url":"https://cdn.example.test/v720","height":720,"vcodec":"vp9","acodec":"none"},
+            {"format_id":"a","url":"https://cdn.example.test/audio","vcodec":"none","acodec":"opus"}
+        ]
+    }"#;
+    let info = parse_provider_json(Provider::YtDlp, ID, doc).unwrap();
+    assert!(matches!(select_playback_streams(&info),
+        Some(PlaybackStreamSelection::Separate { video, audio })
+        if video.format_id == "v720" && audio.format_id == "a"));
 }
