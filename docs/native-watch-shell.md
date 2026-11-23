@@ -321,6 +321,57 @@ No raw URL, cookie, signed media link or unfiltered yt-dlp debug log
 is needed. The performance follow-up is
 [issue #30](https://github.com/rteats/yt-lite/issues/30).
 
+## Last-manifest timing follow-up (2026-11-23)
+
+The user reran both videos with the extended profiler. Each video once again
+reported **one manifest announcement**, four JavaScript solver signals,
+two player API signals, 43 media formats and a combined audio/video format.
+There is no evidence of repeated *logged* manifest downloads on either
+video.
+
+| Measurement (two-run mean) | `dQw4w9WgXcQ` | `fq-Xn7ZOZtg` |
+| --- | ---: | ---: |
+| Total yt-dlp extraction | 4,886 ms | 7,780.5 ms |
+| Last manifest announcement | 3,971.5 ms | 4,710 ms |
+| Remaining after last manifest | **914.5 ms** | **3,070.5 ms** |
+| Manifest announcements | 1 | 1 |
+
+The second video's extraction takes ~2,894.5 ms longer, of which
+~2,156 ms is **after** the last logged manifest announcement. This
+can represent manifest response time, subsequent parsing, finalization,
+or other unlogged work; it does not establish a network cause.
+
+### Next controlled protocol comparison
+
+The profiler now prints **`ManifestType`**: `hls` for m3u8,
+`dash` for MPD, or `other` if the message cannot be identified.
+The yt-dlp benchmark also supports `-ManifestOnly` to compare
+skipping just HLS, just DASH, and both, rather than conflating all
+manifest types with subtitle translations.
+
+The manifest-only benchmark reverses the order of its four variants
+on the second repetition to reduce order effects:
+
+```powershell
+git pull --ff-only
+powershell.exe -NoProfile -File .\experiments\native-player\profile-yt-dlp.ps1 -Repetitions 2
+powershell.exe -NoProfile -File .\experiments\native-player\profile-yt-dlp.ps1 -VideoId fq-Xn7ZOZtg -Repetitions 2
+
+# First video: four extraction variants × two rounds
+powershell.exe -NoProfile -File .\experiments\native-player\bench-yt-dlp.ps1 -ManifestOnly -Repetitions 2
+
+# Second video: same variants, same counts/format comparisons
+powershell.exe -NoProfile -File .\experiments\native-player\bench-yt-dlp.ps1 -ManifestOnly -Repetitions 2 -Url "https://www.youtube.com/watch?v=fq-Xn7ZOZtg"
+```
+
+Do not interpret a faster skip variant as an automatic optimization:
+skipping manifest extraction removes available formats and may affect
+high-quality, live/HLS and separate AV playback. The production
+extractor remains unchanged. The upstream yt-dlp README documents
+`youtube:skip=hls,dash` as extractor options.
+
+Follow-up: [issue #30](https://github.com/rteats/yt-lite/issues/30).
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
