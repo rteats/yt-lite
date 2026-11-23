@@ -7,7 +7,7 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract, HttpPlaybackHeaders, Provider};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback, HttpPlaybackHeaders, Provider};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
@@ -157,7 +157,7 @@ type StreamResolution = Result<ResolvedStream, String>;
 
 /// Fetch metadata on a worker and return one muxed HTTP stream for direct,
 /// incremental libmpv playback. No media file is downloaded or logged.
-fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> Receiver<StreamResolution> {
+fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool) -> Receiver<StreamResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let extraction_started = Instant::now();
@@ -167,7 +167,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> R
                 .build()
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
             runtime.block_on(async {
-                let info = extract(&video_url, provider, &helper).await
+                let info = extract_playback(&video_url, provider, &helper, lean_metadata).await
                     .map_err(|error| format!("{} {}", error.message, error.action))?;
                 let stream = select_muxed_stream(&info).ok_or_else(|| {
                     "No combined audio+video HTTP stream available from this provider".to_string()
@@ -204,9 +204,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut helper = PathBuf::from("yt-dlp");
     let mut requested_provider = Provider::Auto;
     let mut profile_timings = false;
+    let mut lean_metadata = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--timings" => profile_timings = true,
+            "--lean-metadata" => lean_metadata = true,
             "--yt-dlp" => {
                 helper = PathBuf::from(args.next().ok_or("Missing --yt-dlp PATH")?);
             }
@@ -219,6 +221,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ if source.is_none() => source = Some(arg),
             _ => return Err("Only one media source may be supplied".into()),
         }
+    }
+    // Reduced output is experimental and affects yt-dlp metadata only.
+    // Full output remains the default for captions/chapters compatibility.
+    if lean_metadata {
+        eprintln!("[yt-lite] experimental projected playback metadata enabled");
     }
     let input = source.unwrap_or_default();
     let (clip, remote_url) = if input.is_empty() {
@@ -233,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(path), None)
     };
     let initial_provider = preferred_playback_provider(requested_provider);
-    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider));
+    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
@@ -365,7 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // even if the previous video was left paused.
                     let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
                     active_provider = preferred_playback_provider(requested_provider);
-                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider));
+                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata));
                     pending = None;
                     resolving = true;
                     remote_url = Some(canonical.clone());
@@ -501,7 +508,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref url) = remote_url {
                     eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
-                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next));
+                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata));
                     active_provider = next;
                     pending = None;
                     resolving = true;
