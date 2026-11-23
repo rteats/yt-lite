@@ -391,3 +391,74 @@ pub async fn extract_playback(
         },
     }
 }
+
+/// Read-only video search result. The public watch URL is constructed from
+/// video_id later; this type cannot expose signed media URLs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub video_id: String,
+    pub title: String,
+    pub channel: Option<String>,
+    pub duration_seconds: Option<u64>,
+}
+
+/// Validate a search before launching any helper or performing network IO.
+pub fn validated_search_query(input: &str) -> Result<String, ProbeError> {
+    let query = input.trim();
+    if query.is_empty() || query.chars().count() > 120 || query.chars().any(char::is_control) {
+        return Err(ProbeError::new(
+            "invalid_search", "Search must be 1–120 characters on one line.",
+            "Enter a short video search phrase.",
+        ));
+    }
+    Ok(query.to_owned())
+}
+
+/// Parse yt-dlp's flat playlist search response; skip non-video entries and
+/// malformed IDs rather than allowing an arbitrary URL into playback.
+pub fn parse_search_json(json: &str) -> Result<Vec<SearchHit>, ProbeError> {
+    let root: Value = serde_json::from_str(json).map_err(|_| ProbeError::new(
+        "search_malformed", "Search provider returned malformed data.", "Retry the search or update yt-dlp."
+    ))?;
+    let entries = root.get("entries").and_then(Value::as_array).ok_or_else(|| ProbeError::new(
+        "search_malformed", "Search results could not be read.", "Retry the search or update yt-dlp."
+    ))?;
+    Ok(entries.iter().filter_map(|item| {
+        if item.get("_type").and_then(Value::as_str) == Some("playlist") { return None; }
+        let id = string(&item["id"])?;
+        if id.len() != 11 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return None;
+        }
+        let title = string(&item["title"])?;
+        Some(SearchHit {
+            video_id: id,
+            title,
+            channel: string(at(item, &["channel", "uploader"])),
+            duration_seconds: integer(&item["duration"]),
+        })
+    }).take(8).collect())
+}
+
+/// Search via the existing on-device yt-dlp helper without extra proxy
+/// services, authentication, downloads, or per-result video extraction.
+/// The flat result's metadata is intentionally best-effort.
+pub async fn search_youtube(query: &str, helper: &Path) -> Result<Vec<SearchHit>, ProbeError> {
+    let query = validated_search_query(query)?;
+    let target = format!("ytsearch8:{query}");
+    let mut cmd = Command::new(helper);
+    cmd.kill_on_drop(true).args([
+        "--ignore-config", "--no-warnings", "--flat-playlist",
+        "--yes-playlist", "--skip-download", "--dump-single-json",
+        "--socket-timeout", "10", "--", &target,
+    ]);
+    let output = timeout(Duration::from_secs(40), cmd.output()).await
+        .map_err(|_| ProbeError::new("search_timeout", "Search timed out.", "Retry with a shorter query."))?
+        .map_err(|_| ProbeError::new("helper_missing", "Search helper could not start.", "Install or configure local yt-dlp."))?;
+    if !output.status.success() {
+        return Err(ProbeError::new("search_failed", "YouTube search failed.", "Retry or update the local yt-dlp helper."));
+    }
+    let json = std::str::from_utf8(&output.stdout).map_err(|_| ProbeError::new(
+        "search_malformed", "Search helper returned invalid text.", "Update yt-dlp and retry."
+    ))?;
+    parse_search_json(json)
+}
