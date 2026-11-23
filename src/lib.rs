@@ -449,8 +449,8 @@ pub async fn search_youtube(query: &str, helper: &Path) -> Result<Vec<SearchHit>
     cmd.kill_on_drop(true).args([
         "--ignore-config", "--no-warnings", "--flat-playlist",
         "--yes-playlist", "--skip-download", "--dump-single-json",
-        "--socket-timeout", "10", "--", &target,
-    ]);
+        "--socket-timeout", "10", "--",
+    ]).arg(&target);
     let output = timeout(Duration::from_secs(40), cmd.output()).await
         .map_err(|_| ProbeError::new("search_timeout", "Search timed out.", "Retry with a shorter query."))?
         .map_err(|_| ProbeError::new("helper_missing", "Search helper could not start.", "Install or configure local yt-dlp."))?;
