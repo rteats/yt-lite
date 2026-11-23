@@ -590,7 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
     let mut search_receiver: Option<Receiver<SearchResolution>> = None;
-    let mut thumbnail_receiver: Option<Receiver<Option<Vec<u8>>>> = None;
+    let mut thumbnail_receiver: Option<Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>>> = None;
     let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
     let mut resolving = receiver.is_some();
