@@ -6,10 +6,15 @@ param(
     [string] $Url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     [string] $YtDlp = "",
     [ValidateRange(1, 5)] [int] $Repetitions = 2,
-    [switch] $ManifestOnly
+    [switch] $ManifestOnly,
+    [switch] $OutputOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ManifestOnly -and $OutputOnly) {
+    throw "Choose only one benchmark mode: -ManifestOnly or -OutputOnly."
+}
 
 $uri = $null
 if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref] $uri) -or
@@ -39,32 +44,50 @@ if ($ManifestOnly) {
     )
 }
 
+if ($OutputOnly) {
+    # Compare yt-dlp's full infojson serialization with a metadata projection.
+    # A smaller printed document may retain all formats, while omitting
+    # captions from output; that is NOT equivalent to full extraction.
+    $variants = @(
+        @{ Name = "full_infojson"; Extra = @(); Template = $null },
+        @{ Name = "formats_only"; Extra = @(); Template = "%(.{id,title,formats})j" },
+        @{ Name = "formats_captions"; Extra = @(); Template = "%(.{id,title,formats,automatic_captions})j" }
+    )
+}
+
 $common = @(
     "--ignore-config", "--no-playlist", "--no-warnings",
-    "--skip-download", "--dump-single-json",
-    "--socket-timeout", "10"
+    "--skip-download", "--socket-timeout", "10"
 )
 
 for ($round = 1; $round -le $Repetitions; $round++) {
     # A balanced reverse order in successive rounds reduces fixed-order
     # cache/warmup bias without changing the conditions being compared.
     $roundVariants = @($variants)
-    if ($ManifestOnly -and ($round % 2 -eq 0)) {
+    if (($ManifestOnly -or $OutputOnly) -and ($round % 2 -eq 0)) {
         [array]::Reverse($roundVariants)
     }
     foreach ($variant in $roundVariants) {
-        $argsList = @($common) + @($variant.Extra) + @("--", $Url)
+        $argsList = @($common) + @($variant.Extra)
+        if ($OutputOnly -and $null -ne $variant.Template) {
+            $argsList += @("--print", $variant.Template)
+        } else {
+            $argsList += @("--dump-single-json")
+        }
+        $argsList += @("--", $Url)
         $timer = [Diagnostics.Stopwatch]::StartNew()
 
         # JSON stays transient in process memory; output contains counts only.
         $raw = (& $YtDlp @argsList 2>$null | Out-String)
         $exitCode = $LASTEXITCODE
         $timer.Stop()
+        $outputKiB = [math]::Round(([Text.Encoding]::UTF8.GetByteCount($raw) / 1024.0), 1)
 
         if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {
             [pscustomobject]@{
                 Round = $round; Variant = $variant.Name
                 ExtractMs = [int] $timer.ElapsedMilliseconds
+                OutputKiB = $outputKiB; ParseMs = $null; FormatsSha = $null
                 Media = $null; Muxed = $null
                 VideoOnly = $null; AudioOnly = $null; AutoCaptions = $null
                 Result = "failed"
@@ -72,12 +95,16 @@ for ($round = 1; $round -le $Repetitions; $round++) {
             continue
         }
 
+        $parseTimer = [Diagnostics.Stopwatch]::StartNew()
         try {
             $data = $raw | ConvertFrom-Json
+            $parseTimer.Stop()
         } catch {
+            $parseTimer.Stop()
             [pscustomobject]@{
                 Round = $round; Variant = $variant.Name
                 ExtractMs = [int] $timer.ElapsedMilliseconds
+                OutputKiB = $outputKiB; ParseMs = [int] $parseTimer.ElapsedMilliseconds; FormatsSha = $null
                 Media = $null; Muxed = $null
                 VideoOnly = $null; AudioOnly = $null; AutoCaptions = $null
                 Result = "malformed"
@@ -103,17 +130,35 @@ for ($round = 1; $round -le $Repetitions; $round++) {
             $_.acodec -and $_.acodec -ne "none" -and
             (-not $_.vcodec -or $_.vcodec -eq "none")
         }).Count
-        $autoCaptionTracks = 0
+        $autoCaptionTracks = $null
         if ($null -ne $data.automatic_captions) {
+            $autoCaptionTracks = 0
             foreach ($track in $data.automatic_captions.PSObject.Properties) {
                 $autoCaptionTracks += @($track.Value).Count
             }
+        }
+
+        # Stable identity of selected media format descriptors, not signed URLs.
+        # Equal counts can mask differences in format selection.
+        $descriptors = @($media | ForEach-Object {
+            "$($_.format_id)|$($_.vcodec)|$($_.acodec)|$($_.height)"
+        } | Sort-Object) -join "`n"
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $formatDigest = [BitConverter]::ToString(
+                $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($descriptors))
+            ).Replace("-", "").Substring(0, 12)
+        } finally {
+            $sha.Dispose()
         }
 
         [pscustomobject]@{
             Round = $round
             Variant = $variant.Name
             ExtractMs = [int] $timer.ElapsedMilliseconds
+            OutputKiB = $outputKiB
+            ParseMs = [int] $parseTimer.ElapsedMilliseconds
+            FormatsSha = $formatDigest
             Media = $media.Count
             Muxed = $muxed
             VideoOnly = $videoOnly
