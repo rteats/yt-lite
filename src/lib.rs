@@ -332,12 +332,28 @@ async fn rust_extract(url: &str, id: &str) -> Result<ExtractionResult, ProbeErro
     parse_provider_json(Provider::Rust, id, &json)
 }
 
-async fn yt_dlp_extract(url: &str, id: &str, helper: &Path) -> Result<ExtractionResult, ProbeError> {
+/// yt-dlp's projected output preserves all media formats and root HTTP
+/// compatibility headers, but deliberately omits large caption/chapters data.
+/// This is an opt-in playback experiment; the normal extractor remains full.
+pub const YT_DLP_PLAYBACK_FORMAT_ARGS: &[&str] = &[
+    "--print", "%(.{id,title,duration,thumbnail,channel,http_headers,formats})j",
+];
+
+fn yt_dlp_output_args(lean_metadata: bool) -> &'static [&'static str] {
+    if lean_metadata { YT_DLP_PLAYBACK_FORMAT_ARGS } else { &["--dump-single-json"] }
+}
+
+async fn yt_dlp_extract(
+    url: &str,
+    id: &str,
+    helper: &Path,
+    lean_metadata: bool,
+) -> Result<ExtractionResult, ProbeError> {
     let mut cmd = Command::new(helper);
-    cmd.kill_on_drop(true).args([
-        "--ignore-config", "--no-playlist", "--no-warnings", "--skip-download",
-        "--dump-single-json", "--socket-timeout", "10", "--", url,
-    ]);
+    cmd.kill_on_drop(true)
+        .args(["--ignore-config", "--no-playlist", "--no-warnings", "--skip-download"])
+        .args(yt_dlp_output_args(lean_metadata))
+        .args(["--socket-timeout", "10", "--", url]);
     let output = timeout(Duration::from_secs(45), cmd.output()).await
         .map_err(|_| ProbeError::new("timeout", "yt-dlp exceeded its time limit.", "Retry or choose Rust provider."))?
         .map_err(|_| ProbeError::new("helper_missing", "yt-dlp could not be started.", "Supply --yt-dlp PATH to a compatible local helper."))?;
@@ -350,15 +366,28 @@ async fn yt_dlp_extract(url: &str, id: &str, helper: &Path) -> Result<Extraction
     parse_provider_json(Provider::YtDlp, id, json)
 }
 
-/// Real-network provider selection; auto also falls back for missing streams.
+/// Full capability extraction used by the public harness. Never silently
+/// lose captions or chapters in this API.
 pub async fn extract(url: &str, selected: Provider, helper: &Path) -> Result<ExtractionResult, ProbeError> {
+    extract_playback(url, selected, helper, false).await
+}
+
+/// Playback-specific extraction can opt into a smaller yt-dlp response.
+/// Rust provider handling and auto fallback semantics remain unchanged.
+/// Omitted caption/chapter metadata is reported as Unknown, not Unavailable.
+pub async fn extract_playback(
+    url: &str,
+    selected: Provider,
+    helper: &Path,
+    lean_metadata: bool,
+) -> Result<ExtractionResult, ProbeError> {
     let (id, canonical) = canonical_video_url(url)?;
     match selected {
         Provider::Rust => rust_extract(&canonical, &id).await,
-        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper).await,
+        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata).await,
         Provider::Auto => match rust_extract(&canonical, &id).await {
             Ok(result) if matches!(&result.streams, Capability::Available(_)) => Ok(result),
-            _ => yt_dlp_extract(&canonical, &id, helper).await,
+            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata).await,
         },
     }
 }
