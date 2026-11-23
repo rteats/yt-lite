@@ -45,6 +45,59 @@ pub fn select_muxed_stream(
 }
 
 
+/// The muxed stream is preferred because it has a single network input.
+/// Videos with only separate streams can still play without downloading or
+/// merging files, by adding the audio track to the same libmpv session.
+pub enum PlaybackStreamSelection<'a> {
+    Muxed(&'a yt_lite_extraction_proof::Stream),
+    Separate {
+        video: &'a yt_lite_extraction_proof::Stream,
+        audio: &'a yt_lite_extraction_proof::Stream,
+    },
+}
+
+pub fn select_playback_streams(
+    info: &yt_lite_extraction_proof::ExtractionResult,
+) -> Option<PlaybackStreamSelection<'_>> {
+    if let Some(muxed) = select_muxed_stream(info) {
+        return Some(PlaybackStreamSelection::Muxed(muxed));
+    }
+    let yt_lite_extraction_proof::Capability::Available(streams) = &info.streams else {
+        return None;
+    };
+    let http = |s: &&yt_lite_extraction_proof::Stream| {
+        s.url.starts_with("https://") || s.url.starts_with("http://")
+    };
+    let video = streams.iter().filter(|s| s.has_video && !s.has_audio)
+        .filter(http)
+        .max_by_key(|s| (s.height.unwrap_or(0), s.width.unwrap_or(0)))?;
+    let audio = streams.iter().filter(|s| s.has_audio && !s.has_video)
+        .filter(http)
+        .find(|s| s.http_headers == video.http_headers)
+        .or_else(|| streams.iter().filter(|s| s.has_audio && !s.has_video)
+            .filter(http).next())?;
+    Some(PlaybackStreamSelection::Separate { video, audio })
+}
+
+/// Return mpv's video margins as fractions of the physical window height.
+/// The Slint UI is defined in logical px; this conversion preserves the
+/// visible video area under Windows display scaling, resize and fullscreen.
+/// If the window is extremely short, keep a small nonzero video viewport.
+pub fn video_margin_ratios(height_px: u32, scale_factor: f32, has_metadata: bool) -> (f64, f64) {
+    let height = f64::from(height_px.max(1));
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        f64::from(scale_factor)
+    } else { 1.0 };
+    let top = (64.0 + if has_metadata { 54.0 } else { 0.0 }) * scale / height;
+    let bottom = 116.0 * scale / height;
+    let sum = top + bottom;
+    if sum > 0.9 {
+        (top / sum * 0.9, bottom / sum * 0.9)
+    } else {
+        (top, bottom)
+    }
+}
+
 /// A bounded in-memory libmpv demuxer cache for HTTP streaming. This is not
 /// a full-file download: playback begins as soon as enough data is buffered.
 pub const NETWORK_STREAM_OPTIONS: &[(&str, &str)] = &[
