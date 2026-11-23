@@ -736,40 +736,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match response {
                             Ok(page) => {
                                 let results = page.hits;
-                                let status = if results.is_empty() {
+                                // ytsearchN re-fetches a longer prefix instead
+                                // of returning a cursor. Append only unseen IDs
+                                // to the existing model, preserving scroll
+                                // position and already fetched thumbnails.
+                                if search_rows.is_none() {
+                                    let model = Rc::new(slint::VecModel::from(Vec::<SearchRow>::new()));
+                                    ui.set_search_results(model.clone().into());
+                                    search_rows = Some(model);
+                                }
+                                if let Some(ref model) = search_rows {
+                                    let mut existing_ids = (0..model.row_count())
+                                        .filter_map(|index| model.row_data(index))
+                                        .map(|row| row.id.to_string())
+                                        .collect::<std::collections::HashSet<_>>();
+                                    for hit in &results {
+                                        if !existing_ids.insert(hit.video_id.clone()) {
+                                            continue;
+                                        }
+                                        let index = model.row_count();
+                                        model.push(SearchRow {
+                                            id: hit.video_id.clone().into(),
+                                            title: hit.title.clone().into(),
+                                            details: search_result_details(hit).into(),
+                                            thumbnail: slint::Image::default(),
+                                            has_thumbnail: false,
+                                        });
+                                        result_thumbnail_receivers.push((
+                                            index, spawn_thumbnail(hit.video_id.clone()),
+                                        ));
+                                    }
+                                }
+                                let shown = search_rows.as_ref().map(|model| model.row_count())
+                                    .unwrap_or(0);
+                                let status = if shown == 0 {
                                     "No videos found.".to_string()
                                 } else {
-                                    format!("{} video results", results.len())
+                                    format!("{shown} video results")
                                 };
-                                // ytsearchN re-fetches a longer prefix. Keep
-                                // already loaded thumbnails by stable video ID.
-                                let previous_images = search_rows.as_ref().map(|model| {
-                                    (0..model.row_count())
-                                        .filter_map(|index| model.row_data(index))
-                                        .map(|row| (row.id.to_string(), (row.thumbnail, row.has_thumbnail)))
-                                        .collect::<std::collections::HashMap<_, _>>()
-                                }).unwrap_or_default();
-                                result_thumbnail_receivers.clear();
-                                let mut pending_thumbnails = Vec::new();
-                                let rows = results.iter().enumerate().map(|(index, hit)| {
-                                    let (thumbnail, has_thumbnail) = previous_images
-                                        .get(&hit.video_id).cloned()
-                                        .unwrap_or((slint::Image::default(), false));
-                                    if !has_thumbnail {
-                                        pending_thumbnails.push((index, spawn_thumbnail(hit.video_id.clone())));
-                                    }
-                                    SearchRow {
-                                        id: hit.video_id.clone().into(),
-                                        title: hit.title.clone().into(),
-                                        details: search_result_details(hit).into(),
-                                        thumbnail,
-                                        has_thumbnail,
-                                    }
-                                }).collect::<Vec<_>>();
-                                let model = Rc::new(slint::VecModel::from(rows));
-                                ui.set_search_results(model.clone().into());
-                                search_rows = Some(model);
-                                result_thumbnail_receivers = pending_thumbnails;
                                 // Flat YouTube search can return fewer
                                 // *usable* entries than requested. Allow one
                                 // explicit expansion from the initial prefix
