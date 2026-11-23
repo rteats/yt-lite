@@ -110,7 +110,7 @@ slint::slint! {
                 }
                 Text {
                     text: root.video-subtitle;
-                    color: root.dark-mode ? #d2d7e2 : #34485e;
+                    color: root.dark-mode ? #d2d7e2 : #34485f;
                     font-size: 12px;
                     vertical-alignment: center;
                     overflow: elide;
@@ -220,7 +220,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 .enable_all()
                 .build()
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
-            runtime.block_on(async {
+            let bytes = runtime.block_on(async {
                 let info = extract_playback(&video_url, provider, &helper, lean_metadata).await
                     .map_err(|error| format!("{} {}", error.message, error.action))?;
                 let stream = select_muxed_stream(&info).ok_or_else(|| {
@@ -245,10 +245,10 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
 /// Public, fixed-origin thumbnail fetch on a separate worker. It never blocks
 /// media extraction or the Slint UI thread and never follows cross-origin redirects.
 /// Reject oversized responses without reading the complete payload into memory.
-fn spawn_thumbnail(video_id: String) -> Receiver<Option<Vec<u8>>> {
+fn spawn_thumbnail(video_id: String) -> Receiver<Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Option<Vec<u8>> {
+        let result = (|| -> Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>> {
             let url = public_youtube_thumbnail_url(&video_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
             runtime.block_on(async {
@@ -278,7 +278,16 @@ fn spawn_thumbnail(video_id: String) -> Receiver<Option<Vec<u8>>> {
                     }
                 }
                 (!bytes.is_empty()).then_some(bytes)
-            })
+            })?;
+            // Decode on the worker, not in Slint's render/event loop.
+            let rgb = image::load_from_memory(&bytes).ok()?.to_rgb8();
+            let (width, height) = rgb.dimensions();
+            if width == 0 || height == 0 || width > 1024 || height > 1024 {
+                return None;
+            }
+            Some(slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                rgb.as_raw(), width, height,
+            ))
         })();
         let _ = sender.send(result);
     });
@@ -586,12 +595,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Decode small JPEG/PNG thumbnails only after they reach the UI thread.
         if let Some(rx) = thumbnail_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Some(bytes)) => {
+                Ok(Some(pixels)) => {
                     if let Some(ui) = label_window.upgrade() {
-                        if let Ok(image) = slint::Image::load_from_data(&bytes, None) {
-                            ui.set_video_thumbnail(image);
-                            ui.set_has_thumbnail(true);
-                        }
+                        ui.set_video_thumbnail(slint::Image::from_rgb8(pixels));
+                        ui.set_has_thumbnail(true);
                     }
                     thumbnail_receiver = None;
                 }
