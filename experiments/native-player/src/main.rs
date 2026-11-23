@@ -585,6 +585,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_window = window.as_weak();
     let video_session = player.clone();
     let rendering_clip = clip_source.clone();
+    let mut margin_warning_logged = false;
     window.window().set_rendering_notifier(move |phase, api| {
         if !matches!(api, GraphicsAPI::NativeOpenGL { .. }) { return; }
         match phase {
@@ -596,7 +597,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             RenderingState::BeforeRendering => {
                 if let Some(ui) = video_window.upgrade() {
                     let size = ui.window().size();
-                    video_session.borrow_mut().draw(size.width, size.height);
+                    let mut player = video_session.borrow_mut();
+                    if let Err(error) = player.update_video_margins(
+                        size.height, ui.window().scale_factor(), ui.get_has_video_info(),
+                    ) {
+                        if !margin_warning_logged {
+                            eprintln!("[yt-lite] Could not reserve video viewport: {error}");
+                            margin_warning_logged = true;
+                        }
+                    }
+                    player.draw(size.width, size.height);
                 }
             }
             RenderingState::RenderingTeardown => video_session.borrow_mut().teardown_render(),
