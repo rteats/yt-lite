@@ -56,6 +56,7 @@ struct MpvEndFile {
 pub enum PlaybackEvent {
     StartFile,
     FileLoaded,
+    PlaybackRestart,
     LoadFailed(i32),
     Ended,
 }
@@ -67,6 +68,7 @@ const MPV_EVENT_COMMAND_REPLY: c_int = 5;
 const MPV_EVENT_START_FILE: c_int = 6;
 const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
+const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
 const LOADFILE_REPLY_ID: u64 = 0x594c_4f41_44;
 
@@ -295,6 +297,7 @@ impl Player {
             match event.event_id {
                 MPV_EVENT_START_FILE => events.push(PlaybackEvent::StartFile),
                 MPV_EVENT_FILE_LOADED => events.push(PlaybackEvent::FileLoaded),
+                MPV_EVENT_PLAYBACK_RESTART => events.push(PlaybackEvent::PlaybackRestart),
                 MPV_EVENT_COMMAND_REPLY if event.reply_userdata == LOADFILE_REPLY_ID && event.error < 0 => {
                     events.push(PlaybackEvent::LoadFailed(event.error));
                 }

@@ -1,5 +1,5 @@
 #![cfg(target_os = "windows")]
-//! Standalone issue #2 prototype: one Slint window, one libmpv core, one GL render context.
+//! Native watch-shell increment: one Slint window and one libmpv core.
 //! Experimental local-file and YouTube URL playback, not a release-ready watch page.
 
 mod mpv;
@@ -7,27 +7,72 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract, HttpPlaybackHeaders, Provider};
-use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, select_muxed_stream, PlaybackAction};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback, HttpPlaybackHeaders, Provider};
+use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, select_muxed_stream, PlaybackAction};
 
 slint::slint! {
-    import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+    import { Button, HorizontalBox, VerticalBox, LineEdit, Palette } from "std-widgets.slint";
 
     export component PlayerWindow inherits Window {
-        title: "yt-lite / native playback proof";
+        title: "yt-lite / watch";
         preferred-width: 1000px;
         preferred-height: 640px;
-        min-width: 560px;
+        min-width: 660px;
         min-height: 300px;
         background: transparent;
 
         in-out property <bool> paused: false;
         in-out property <float> fraction: 0;
-        in-out property <string> status: "Opening source...";
+        in-out property <string> status: "Paste a YouTube URL above to begin."; 
+        in-out property <string> url-text: "";
+        in-out property <bool> has-url: false;
+        in-out property <bool> has-media: false;
+        in-out property <bool> dark-mode: Palette.color-scheme == ColorScheme.dark;
+        callback open-url(string);
+        callback open-browser();
         callback toggle-pause();
         callback seek-by(int);
         callback seek-to(float);
         callback toggle-fullscreen();
+
+        // An interactive native watch header over the video render surface.
+        // LineEdit offers keyboard focus/paste, and Enter also opens the URL.
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 64px;
+            background: root.dark-mode ? #ee1b202b : #f1f4f6;
+            HorizontalBox {
+                padding: 10px;
+                spacing: 8px;
+                Text {
+                    text: "yt-lite";
+                    color: root.dark-mode ? white : #19242f;
+                    font-size: 18px;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    horizontal-stretch: 1;
+                    text <=> root.url-text;
+                    placeholder-text: "Paste a YouTube video URL...";
+                    accepted(text) => { root.open-url(text); }
+                }
+                Button {
+                    text: "Open";
+                    clicked => { root.open-url(root.url-text); }
+                }
+                Button {
+                    text: "Browser";
+                    enabled: root.has-url;
+                    clicked => { root.open-browser(); }
+                }
+                Button {
+                    text: root.dark-mode ? "Light" : "Dark";
+                    clicked => { Palette.color-scheme = root.dark-mode ? ColorScheme.light : ColorScheme.dark; }
+                }
+            }
+        }
 
         // The transparent window is deliberate: libmpv draws the GL underlay
         // before Slint paints these controls over it.
@@ -36,13 +81,13 @@ slint::slint! {
             height: 106px;
             x: 0px;
             y: parent.height - self.height;
-            background: #d51b202b;
+            background: root.dark-mode ? #d51b202b : #e9f5f5f7;
             VerticalBox {
                 padding: 10px;
                 spacing: 9px;
                 Text {
                     text: root.status;
-                    color: white;
+                    color: root.dark-mode ? white : #19242f;
                     font-size: 13px;
                     vertical-alignment: center;
                 }
@@ -69,14 +114,17 @@ slint::slint! {
                 HorizontalBox {
                     spacing: 10px;
                     Button {
+                        enabled: root.has-media;
                         text: root.paused ? "Play" : "Pause";
                         clicked => { root.toggle-pause(); }
                     }
                     Button {
+                        enabled: root.has-media;
                         text: "-10 s";
                         clicked => { root.seek-by(-10); }
                     }
                     Button {
+                        enabled: root.has-media;
                         text: "+10 s";
                         clicked => { root.seek-by(10); }
                     }
@@ -102,22 +150,24 @@ struct ResolvedStream {
     title: String,
     provider: Provider,
     headers: HttpPlaybackHeaders,
+    extraction_ms: u128,
 }
 
 type StreamResolution = Result<ResolvedStream, String>;
 
 /// Fetch metadata on a worker and return one muxed HTTP stream for direct,
 /// incremental libmpv playback. No media file is downloaded or logged.
-fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> Receiver<StreamResolution> {
+fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool) -> Receiver<StreamResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
+        let extraction_started = Instant::now();
         let result = (|| -> StreamResolution {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
             runtime.block_on(async {
-                let info = extract(&video_url, provider, &helper).await
+                let info = extract_playback(&video_url, provider, &helper, lean_metadata).await
                     .map_err(|error| format!("{} {}", error.message, error.action))?;
                 let stream = select_muxed_stream(&info).ok_or_else(|| {
                     "No combined audio+video HTTP stream available from this provider".to_string()
@@ -129,6 +179,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider) -> R
                     title: info.title,
                     provider,
                     headers,
+                    extraction_ms: extraction_started.elapsed().as_millis(),
                 })
             })
         })();
@@ -146,14 +197,18 @@ fn provider_label(provider: Provider) -> &'static str {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Flags work with or without a startup video; users can paste the URL
+    // later in the watch bar. Reject ambiguous multiple media sources.
     let mut args = std::env::args().skip(1);
-    let input = args.next().ok_or(
-        "Usage: yt-lite-native-player-proof <local-video-file | YouTube-video-URL> [--provider auto|rust|yt-dlp] [--yt-dlp PATH]"
-    )?;
+    let mut source: Option<String> = None;
     let mut helper = PathBuf::from("yt-dlp");
     let mut requested_provider = Provider::Auto;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
+    let mut profile_timings = false;
+    let mut lean_metadata = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--timings" => profile_timings = true,
+            "--lean-metadata" => lean_metadata = true,
             "--yt-dlp" => {
                 helper = PathBuf::from(args.next().ok_or("Missing --yt-dlp PATH")?);
             }
@@ -162,10 +217,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 requested_provider = Provider::parse(&selection)
                     .ok_or("Provider must be auto, rust or yt-dlp")?;
             }
-            _ => return Err(format!("Unknown option: {flag}").into()),
+            _ if arg.starts_with("--") => return Err(format!("Unknown option: {arg}").into()),
+            _ if source.is_none() => source = Some(arg),
+            _ => return Err("Only one media source may be supplied".into()),
         }
     }
-    let (clip, remote_url) = if input.starts_with("https://") || input.starts_with("http://") {
+    // Reduced output is experimental and affects yt-dlp metadata only.
+    // Full output remains the default for captions/chapters compatibility.
+    if lean_metadata {
+        eprintln!("[yt-lite] experimental projected playback metadata enabled");
+    }
+    let input = source.unwrap_or_default();
+    let (clip, remote_url) = if input.is_empty() {
+        (None, None)
+    } else if input.starts_with("https://") || input.starts_with("http://") {
         let (_, canonical) = canonical_video_url(&input)
             .map_err(|error| format!("{} {}", error.message, error.action))?;
         (None, Some(canonical))
@@ -174,13 +239,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
-    let initial_provider = if requested_provider == Provider::Auto { Provider::Rust } else { requested_provider };
-    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider));
+    let initial_provider = preferred_playback_provider(requested_provider);
+    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
     let window = PlayerWindow::new()?;
+    window.set_has_url(remote_url.is_some());
+    window.set_has_media(clip.is_some());
+    if let Some(ref url) = remote_url {
+        window.set_url_text(url.as_str().into());
+    }
+
+    // UI callbacks only enqueue a request. The timer handles validation,
+    // cancellation and lifecycle; no synchronous network IO runs in Slint.
+    let requested_url = Rc::new(RefCell::new(None::<String>));
+    let new_request = requested_url.clone();
+    window.on_open_url(move |input| {
+        *new_request.borrow_mut() = Some(input.to_string());
+    });
+
+    // Browser fallback gets only a canonicalized URL; never a signed media
+    // URL, arbitrary URI scheme or extractor response.
+    let browser_url = Rc::new(RefCell::new(remote_url.clone()));
+    let external_url = browser_url.clone();
+    window.on_open_browser(move || {
+        if let Some(url) = external_url.borrow().clone() {
+            std::thread::spawn(move || {
+                if webbrowser::open(&url).is_err() {
+                    eprintln!("[yt-lite] Could not open the system browser");
+                }
+            });
+        }
+    });
+
+    let clip_source = Rc::new(RefCell::new(clip));
     let player = Rc::new(RefCell::new(Player::open()?));
+
+    let seek_started = Rc::new(RefCell::new(None::<Instant>));
 
     let controls = player.clone();
     window.on_toggle_pause(move || {
@@ -192,22 +288,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let controls = player.clone();
+    let relative_seek_started = seek_started.clone();
     window.on_seek_by(move |seconds| {
         if let Some(command) = command_for(PlaybackAction::SeekRelative(seconds.into())) {
-            if let Err(error) = controls.borrow().send_strings(&command) {
-                eprintln!("Seek error: {error}");
+            match controls.borrow().send_strings(&command) {
+                Ok(()) if profile_timings => *relative_seek_started.borrow_mut() = Some(Instant::now()),
+                Err(error) => eprintln!("Seek error: {error}"),
+                _ => {}
             }
         }
     });
 
     let controls = player.clone();
+    let absolute_seek_started = seek_started.clone();
     window.on_seek_to(move |fraction| {
         let duration = controls.borrow().property_double(c"duration").unwrap_or(0.0);
         if let Some(command) = command_for(PlaybackAction::SeekFraction {
             fraction: f64::from(fraction), duration_seconds: duration,
         }) {
-            if let Err(error) = controls.borrow().send_strings(&command) {
-                eprintln!("Scrub error: {error}");
+            match controls.borrow().send_strings(&command) {
+                Ok(()) if profile_timings => *absolute_seek_started.borrow_mut() = Some(Instant::now()),
+                Err(error) => eprintln!("Scrub error: {error}"),
+                _ => {}
             }
         }
     });
@@ -222,11 +324,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let video_window = window.as_weak();
     let video_session = player.clone();
+    let rendering_clip = clip_source.clone();
     window.window().set_rendering_notifier(move |phase, api| {
         if !matches!(api, GraphicsAPI::NativeOpenGL { .. }) { return; }
         match phase {
             RenderingState::RenderingSetup => {
-                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), clip.as_deref()) {
+                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), rendering_clip.borrow().as_deref()) {
                     eprintln!("Video initialization error: {error}");
                 }
             }
@@ -243,7 +346,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let label_window = window.as_weak();
     let label_player = player.clone();
+    let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
+    let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
     let mut resolving = receiver.is_some();
     let mut media_title: Option<String> = None;
@@ -256,6 +361,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut has_network_media = false;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        // A new watch URL replaces the current playback session but does not
+        // construct a new libmpv core. In-flight extraction results are dropped.
+        if let Some(input) = requested_url.borrow_mut().take() {
+            match canonical_video_url(input.trim()) {
+                Ok((_, canonical)) => {
+                    let _ = label_player.borrow().send_strings(&["stop".into()]);
+                    *pending_seek_timing.borrow_mut() = None;
+                    // An explicit user Open action should start the new video
+                    // even if the previous video was left paused.
+                    let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
+                    active_provider = preferred_playback_provider(requested_provider);
+                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata));
+                    pending = None;
+                    resolving = true;
+                    remote_url = Some(canonical.clone());
+                    *browser_url.borrow_mut() = Some(canonical.clone());
+                    clip_source.borrow_mut().take();
+                    media_title = None;
+                    playback_error = None;
+                    load_started = None;
+                    file_loaded = false;
+                    file_loaded_at = None;
+                    playback_advanced = false;
+                    has_network_media = false;
+                    if let Some(ui) = label_window.upgrade() {
+                        ui.set_has_url(true);
+                        ui.set_has_media(false);
+                        ui.set_url_text(canonical.into());
+                        ui.set_fraction(0.0);
+                    }
+                }
+                Err(error) => {
+                    playback_error = Some(format!("{} {}", error.message, error.action));
+                }
+            }
+        }
         let mut failure: Option<String> = None;
 
         // Unlike the earlier prototype, consume the mpv event queue. An
@@ -265,9 +406,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PlaybackEvent::StartFile => {
                     // This may also fire when retrying; do not interpret as playback.
                 }
+                PlaybackEvent::PlaybackRestart => {
+                    if profile_timings {
+                        if let Some(start) = pending_seek_timing.borrow_mut().take() {
+                            eprintln!("[yt-lite] timing seek-to-playback-restart={}ms", start.elapsed().as_millis());
+                        }
+                    }
+                }
                 PlaybackEvent::FileLoaded => {
-                    if load_started.is_some() {
-                        load_started = None;
+                    if (remote_url.is_none() || load_started.is_some()) && label_window.upgrade().is_some() {
+                        if let Some(ui) = label_window.upgrade() {
+                            ui.set_has_media(true);
+                        }
+                    }
+                    if let Some(start) = load_started.take() {
+                        if profile_timings {
+                            eprintln!("[yt-lite] timing libmpv-load={}ms", start.elapsed().as_millis());
+                        }
                         file_loaded = true;
                         file_loaded_at = Some(Instant::now());
                         eprintln!("[yt-lite] {} media loaded; streaming", provider_label(active_provider));
@@ -325,6 +480,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match response {
                     Ok(stream) => {
                         active_provider = stream.provider;
+                        if profile_timings {
+                            eprintln!("[yt-lite] timing {}-extract={}ms", provider_label(stream.provider), stream.extraction_ms);
+                        }
                         media_title = Some(stream.title);
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
                         match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
@@ -350,7 +508,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref url) = remote_url {
                     eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
-                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next));
+                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata));
                     active_provider = next;
                     pending = None;
                     resolving = true;
@@ -360,6 +518,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file_loaded_at = None;
                     playback_advanced = false;
                     has_network_media = false;
+                    if let Some(ui) = label_window.upgrade() {
+                        ui.set_has_media(false);
+                    }
                 } else {
                     playback_error = Some(err);
                 }
@@ -369,12 +530,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolving = false;
                 load_started = None;
                 file_loaded_at = None;
+                if let Some(ui) = label_window.upgrade() {
+                    ui.set_has_media(false);
+                }
             }
         }
 
         if let Some(ui) = label_window.upgrade() {
             if let Some(ref err) = playback_error {
-                ui.set_status(format!("Playback failed: {err}").into());
+                ui.set_status(format!("Open failed: {err}").into());
+                return;
+            }
+            if remote_url.is_none() && clip_source.borrow().is_none() {
+                ui.set_status("Paste a YouTube URL above and press Enter.".into());
+                ui.set_fraction(0.0);
                 return;
             }
             if resolving {

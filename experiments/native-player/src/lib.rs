@@ -56,15 +56,27 @@ pub const NETWORK_STREAM_OPTIONS: &[(&str, &str)] = &[
     ("network-timeout", "20"),
 ];
 
-/// With 'auto', retry from yt-dlp if the Rust URL fails during playback,
-/// not just if the extractor itself fails. Explicit provider choices are strict.
+/// Prefer the provider that actually played a YouTube video on Windows.
+/// Rust extraction is retained as an optional backup and an explicit choice.
+pub fn preferred_playback_provider(
+    selected: yt_lite_extraction_proof::Provider,
+) -> yt_lite_extraction_proof::Provider {
+    use yt_lite_extraction_proof::Provider;
+    match selected {
+        Provider::Auto => Provider::YtDlp,
+        selected => selected,
+    }
+}
+
+/// Only automatic playback retries through the alternative provider, once.
+/// Explicit provider choices must remain strict, including privacy settings.
 pub fn fallback_after_playback_error(
     failed: yt_lite_extraction_proof::Provider,
     requested: yt_lite_extraction_proof::Provider,
 ) -> Option<yt_lite_extraction_proof::Provider> {
     use yt_lite_extraction_proof::Provider;
     match (failed, requested) {
-        (Provider::Rust, Provider::Auto) => Some(Provider::YtDlp),
+        (Provider::YtDlp, Provider::Auto) => Some(Provider::Rust),
         _ => None,
     }
 }
