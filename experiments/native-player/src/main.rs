@@ -624,10 +624,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     format!("{} video results", results.len())
                                 };
-                                let rows = results.into_iter().map(|hit| SearchRow {
-                                    id: hit.video_id.into(),
-                                    title: hit.title.into(),
-                                    details: search_result_details(&hit).into(),
+                                let rows = results.into_iter().map(|hit| {
+                                    let details = search_result_details(&hit);
+                                    SearchRow {
+                                        id: hit.video_id.into(),
+                                        title: hit.title.into(),
+                                        details: details.into(),
+                                    }
                                 }).collect::<Vec<_>>();
                                 ui.set_search_results(slint::ModelRc::new(slint::VecModel::from(rows)));
                                 ui.set_search_status(status.into());
