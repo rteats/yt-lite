@@ -59,3 +59,20 @@ fn search_can_request_more_than_eight_results_and_limits_work() {
     assert_eq!(parsed.len(), SEARCH_MAX_RESULTS);
     assert_eq!(parsed[15].title, "Video 15");
 }
+
+#[test]
+fn a_filtered_search_result_does_not_hide_the_next_batch() {
+    use yt_lite_extraction_proof::parse_search_page;
+    let entries = (0..8).map(|i| {
+        if i == 3 {
+            r#"{"id":"not-a-valid-id","title":"Skipped invalid result"}"#.to_string()
+        } else {
+            format!(r#"{{"id":"v{i:010}","title":"Video {i}"}}"#)
+        }
+    }).collect::<Vec<_>>().join(",");
+    let page = parse_search_page(&format!(r#"{{"entries":[{entries}]}}"#), 8).unwrap();
+    assert_eq!(page.hits.len(), 7);
+    assert!(page.has_more);
+    let short = parse_search_page(r#"{"entries":[{"id":"dQw4w9WgXcQ","title":"Only result"}]}"#, 8).unwrap();
+    assert!(!short.has_more);
+}
