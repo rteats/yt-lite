@@ -25,6 +25,14 @@ function Get-SafeMilestone {
     return $null
 }
 
+# Return a protocol category, never the manifest URL itself.
+function Get-SafeManifestType {
+    param([AllowEmptyString()][string] $Line)
+    if ($Line -match '(?i)\bm3u8\b') { return 'hls' }
+    if ($Line -match '(?i)\bmpd\b') { return 'dash' }
+    return 'other'
+}
+
 if ($SelfTest) {
     $samples = @(
         @{ Text = '[youtube] SAMPLE12345: Downloading webpage'; Kind = 'webpage' },
@@ -39,6 +47,11 @@ if ($SelfTest) {
         if ((Get-SafeMilestone $sample.Text) -ne $sample.Kind) {
             throw 'Milestone classification self-test failed.'
         }
+    }
+    if ((Get-SafeManifestType '[youtube] id: Downloading m3u8 information') -ne 'hls' -or
+        (Get-SafeManifestType '[youtube] id: Downloading mpd manifest') -ne 'dash' -or
+        (Get-SafeManifestType '[youtube] id: Downloading manifest') -ne 'other') {
+        throw 'Manifest protocol classifier self-test failed.'
     }
     Write-Output 'profile-yt-dlp milestone self-test: passed'
     return
@@ -82,6 +95,7 @@ for ($round = 1; $round -le $Repetitions; $round++) {
     $apiSignals = 0
     $manifestSignals = 0
     $lastManifestMs = $null
+    $lastManifestType = $null
     $lastJscMs = $null
     $result = 'failed'
     $formats = $null
@@ -120,6 +134,7 @@ for ($round = 1; $round -le $Repetitions; $round++) {
                 if ($kind -eq 'manifest') {
                     $manifestSignals++
                     $lastManifestMs = $elapsed
+                    $lastManifestType = Get-SafeManifestType $line
                 }
             }
             $stderrTask = $process.StandardError.ReadLineAsync()
@@ -173,6 +188,7 @@ for ($round = 1; $round -le $Repetitions; $round++) {
         JscSignalMs = if ($milestones.ContainsKey('javascript')) { $milestones['javascript'] } else { $null }
         ManifestMs = if ($milestones.ContainsKey('manifest')) { $milestones['manifest'] } else { $null }
         LastManifestMs = $lastManifestMs
+        ManifestType = $lastManifestType
         ManifestSignals = $manifestSignals
         AfterLastManifestMs = if ($null -ne $lastManifestMs) { [int] ($watch.ElapsedMilliseconds - $lastManifestMs) } else { $null }
         LastJscMs = $lastJscMs
