@@ -7,11 +7,13 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract_playback, HttpPlaybackHeaders, Provider};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, PlaybackAction, WatchMetadata};
 
 slint::slint! {
-    import { Button, HorizontalBox, VerticalBox, LineEdit, Palette } from "std-widgets.slint";
+    import { Button, HorizontalBox, VerticalBox, LineEdit, ListView, Palette } from "std-widgets.slint";
+
+    export struct SearchRow { id: string, title: string, details: string }
 
     export component PlayerWindow inherits Window {
         title: "yt-lite / watch";
@@ -35,6 +37,12 @@ slint::slint! {
         in-out property <bool> has-thumbnail: false;
         in-out property <bool> can-retry: false;
         callback retry();
+        in-out property <bool> show-search: false;
+        in-out property <string> search-status: "";
+        in-out property <[SearchRow]> search-results;
+        callback search(string);
+        callback open-result(string);
+        callback close-search();
         callback open-url(string);
         callback open-browser();
         callback toggle-pause();
@@ -62,12 +70,16 @@ slint::slint! {
                 LineEdit {
                     horizontal-stretch: 1;
                     text <=> root.url-text;
-                    placeholder-text: "Paste a YouTube video URL...";
+                    placeholder-text: "Paste video URL or enter search terms...";
                     accepted(text) => { root.open-url(text); }
                 }
                 Button {
                     text: "Open";
                     clicked => { root.open-url(root.url-text); }
+                }
+                Button {
+                    text: "Search";
+                    clicked => { root.search(root.url-text); }
                 }
                 Button {
                     text: "Browser";
@@ -190,6 +202,68 @@ slint::slint! {
                 }
             }
         }
+
+        // Native search results remain a separate browsing overlay; searching
+        // never pauses, unloads or reconstructs the current libmpv session.
+        Rectangle {
+            visible: root.show-search;
+            x: parent.width - self.width - 10px;
+            y: 120px;
+            width: 350px;
+            height: parent.height - 242px;
+            background: root.dark-mode ? #f21b202b : #f5f8fb;
+            border-radius: 8px;
+            VerticalBox {
+                padding: 10px;
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 6px;
+                    Text {
+                        text: root.search-status;
+                        color: root.dark-mode ? white : #19242f;
+                        font-size: 13px;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Button {
+                        text: "Close";
+                        clicked => { root.close-search(); }
+                    }
+                }
+                ListView {
+                    for hit in root.search-results : Rectangle {
+                        width: parent.width;
+                        height: 66px;
+                        background: root.dark-mode ? #243043 : #e9eef3;
+                        border-radius: 4px;
+                        Text {
+                            text: hit.title;
+                            x: 8px;
+                            y: 6px;
+                            width: parent.width - 16px;
+                            height: 30px;
+                            color: root.dark-mode ? white : #19242f;
+                            font-size: 13px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: hit.details;
+                            x: 8px;
+                            y: 37px;
+                            width: parent.width - 16px;
+                            height: 20px;
+                            color: root.dark-mode ? #d2d7e2 : #34485e;
+                            font-size: 11px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.open-result(hit.id); } }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -285,6 +359,37 @@ fn spawn_thumbnail(video_id: String) -> Receiver<Option<Vec<u8>>> {
     receiver
 }
 
+type SearchResolution = Result<Vec<SearchHit>, String>;
+
+/// Search runs on its own worker. The current video keeps playing while
+/// yt-dlp reads a small, flat result list (no per-result video extraction).
+fn spawn_search(query: String, helper: PathBuf) -> Receiver<SearchResolution> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let response = (|| -> SearchResolution {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().map_err(|_| "Could not initialize search runtime".to_string())?;
+            runtime.block_on(async {
+                search_youtube(&query, &helper).await
+                    .map_err(|error| format!("{} {}", error.message, error.action))
+            })
+        })();
+        let _ = sender.send(response);
+    });
+    receiver
+}
+
+fn search_result_details(hit: &SearchHit) -> String {
+    let mut pieces = Vec::new();
+    if let Some(channel) = hit.channel.as_deref() { pieces.push(channel.to_owned()); }
+    if let Some(seconds) = hit.duration_seconds {
+        pieces.push(if seconds >= 3600 {
+            format!("{}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+        } else { format!("{}:{:02}", seconds / 60, seconds % 60) });
+    }
+    pieces.join(" · ")
+}
+
 fn provider_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Rust => "Rust",
@@ -354,6 +459,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let new_request = requested_url.clone();
     window.on_open_url(move |input| {
         *new_request.borrow_mut() = Some(input.to_string());
+    });
+    let search_requested = Rc::new(RefCell::new(None::<String>));
+    let new_search = search_requested.clone();
+    window.on_search(move |input| {
+        *new_search.borrow_mut() = Some(input.to_string());
+    });
+
+    let result_request = requested_url.clone();
+    let result_window = window.as_weak();
+    window.on_open_result(move |id| {
+        let url = format!("https://www.youtube.com/watch?v={id}");
+        if let Ok((_, canonical)) = canonical_video_url(&url) {
+            *result_request.borrow_mut() = Some(canonical);
+            if let Some(ui) = result_window.upgrade() {
+                ui.set_show_search(false);
+            }
+        }
+    });
+
+    let close_window = window.as_weak();
+    window.on_close_search(move || {
+        if let Some(ui) = close_window.upgrade() { ui.set_show_search(false); }
     });
 
     // Browser fallback gets only a canonicalized URL; never a signed media
@@ -453,6 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label_player = player.clone();
     let pending_seek_timing = seek_started.clone();
     let mut receiver = remote_receiver;
+    let mut search_receiver: Option<Receiver<SearchResolution>> = None;
     let mut thumbnail_receiver: Option<Receiver<Option<Vec<u8>>>> = None;
     let mut remote_url = remote_url;
     let mut pending: Option<StreamResolution> = None;
@@ -467,6 +595,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut has_network_media = false;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        if let Some(query) = search_requested.borrow_mut().take() {
+            if let Some(ui) = label_window.upgrade() {
+                ui.set_show_search(true);
+                ui.set_search_results(slint::ModelRc::new(slint::VecModel::from(Vec::<SearchRow>::new())));
+                match validated_search_query(&query) {
+                    Ok(clean) => {
+                        ui.set_search_status("Searching YouTube...".into());
+                        search_receiver = Some(spawn_search(clean, helper.clone()));
+                    }
+                    Err(error) => {
+                        ui.set_search_status(error.message.into());
+                        search_receiver = None;
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = search_receiver.as_ref() {
+            match rx.try_recv() {
+                Ok(response) => {
+                    search_receiver = None;
+                    if let Some(ui) = label_window.upgrade() {
+                        match response {
+                            Ok(results) => {
+                                let status = if results.is_empty() {
+                                    "No videos found.".to_string()
+                                } else {
+                                    format!("{} video results", results.len())
+                                };
+                                let rows = results.into_iter().map(|hit| SearchRow {
+                                    id: hit.video_id.into(),
+                                    title: hit.title.into(),
+                                    details: search_result_details(&hit).into(),
+                                }).collect::<Vec<_>>();
+                                ui.set_search_results(slint::ModelRc::new(slint::VecModel::from(rows)));
+                                ui.set_search_status(status.into());
+                            }
+                            Err(error) => ui.set_search_status(format!("Search failed: {error}").into()),
+                        }
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    search_receiver = None;
+                    if let Some(ui) = label_window.upgrade() {
+                        ui.set_search_status("Search worker stopped. Retry.".into());
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
         // A new watch URL replaces the current playback session but does not
         // construct a new libmpv core. In-flight extraction results are dropped.
         if let Some(input) = requested_url.borrow_mut().take() {
@@ -474,6 +653,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok((_, canonical)) => {
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
                     *pending_seek_timing.borrow_mut() = None;
+                    search_receiver = None;
+                    if let Some(ui) = label_window.upgrade() { ui.set_show_search(false); }
                     // An explicit user Open action should start the new video
                     // even if the previous video was left paused.
                     let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
