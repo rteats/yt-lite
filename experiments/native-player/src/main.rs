@@ -629,7 +629,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let size = ui.window().size();
                     let mut player = video_session.borrow_mut();
                     if let Err(error) = player.update_video_margins(
-                        size.height, ui.window().scale_factor(), ui.get_has_video_info(),
+                        size.width, size.height, ui.window().scale_factor(),
+                        ui.get_has_video_info(), ui.get_show_search(),
                     ) {
                         if !margin_warning_logged {
                             eprintln!("[yt-lite] Could not reserve video viewport: {error}");
