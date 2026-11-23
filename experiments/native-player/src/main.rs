@@ -220,7 +220,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 .enable_all()
                 .build()
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
-            let bytes = runtime.block_on(async {
+            runtime.block_on(async {
                 let info = extract_playback(&video_url, provider, &helper, lean_metadata).await
                     .map_err(|error| format!("{} {}", error.message, error.action))?;
                 let stream = select_muxed_stream(&info).ok_or_else(|| {
@@ -251,7 +251,7 @@ fn spawn_thumbnail(video_id: String) -> Receiver<Option<slint::SharedPixelBuffer
         let result = (|| -> Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>> {
             let url = public_youtube_thumbnail_url(&video_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
-            runtime.block_on(async {
+            let bytes = runtime.block_on(async {
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .timeout(Duration::from_secs(6)).build().ok()?;
