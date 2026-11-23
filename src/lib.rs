@@ -407,6 +407,14 @@ pub struct SearchHit {
     pub duration_seconds: Option<u64>,
 }
 
+/// A single search prefix, including whether yt-dlp returned the full
+/// requested batch before invalid/non-video items were filtered out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub has_more: bool,
+}
+
 /// Validate a search before launching any helper or performing network IO.
 pub fn validated_search_query(input: &str) -> Result<String, ProbeError> {
     let query = input.trim();
@@ -456,16 +464,36 @@ pub fn parse_search_json(json: &str) -> Result<Vec<SearchHit>, ProbeError> {
     }).take(SEARCH_MAX_RESULTS).collect())
 }
 
+/// Parse a search prefix and record its raw entry count, so a filtered
+/// playlist/invalid item does not incorrectly hide pagination controls.
+pub fn parse_search_page(json: &str, requested: usize) -> Result<SearchPage, ProbeError> {
+    if requested == 0 || requested > SEARCH_MAX_RESULTS {
+        return Err(ProbeError::new("invalid_search_size",
+            "Search size must be between 1 and 40.", "Use Load more for additional results."));
+    }
+    let root: Value = serde_json::from_str(json).map_err(|_| ProbeError::new(
+        "search_malformed", "Search provider returned malformed data.",
+        "Retry the search or update yt-dlp."))?;
+    let raw_count = root.get("entries").and_then(Value::as_array)
+        .ok_or_else(|| ProbeError::new(
+            "search_malformed", "Search results could not be read.",
+            "Retry the search or update yt-dlp."))?.len();
+    Ok(SearchPage {
+        hits: parse_search_json(json)?,
+        has_more: raw_count >= requested && requested < SEARCH_MAX_RESULTS,
+    })
+}
+
 /// Search via the existing on-device yt-dlp helper without extra proxy
 /// services, authentication, downloads, or per-result video extraction.
 /// The flat result's metadata is intentionally best-effort.
 pub async fn search_youtube(query: &str, helper: &Path) -> Result<Vec<SearchHit>, ProbeError> {
-    search_youtube_with_limit(query, helper, SEARCH_BATCH_SIZE).await
+    Ok(search_youtube_with_limit(query, helper, SEARCH_BATCH_SIZE).await?.hits)
 }
 
 /// Return the first N public search hits. Newer batches repeat earlier hits
 /// because yt-dlp's ytsearchN does not expose a stable pagination cursor.
-pub async fn search_youtube_with_limit(query: &str, helper: &Path, count: usize) -> Result<Vec<SearchHit>, ProbeError> {
+pub async fn search_youtube_with_limit(query: &str, helper: &Path, count: usize) -> Result<SearchPage, ProbeError> {
     let target = search_target(query, count)?;
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true).args([
@@ -482,5 +510,5 @@ pub async fn search_youtube_with_limit(query: &str, helper: &Path, count: usize)
     let json = std::str::from_utf8(&output.stdout).map_err(|_| ProbeError::new(
         "search_malformed", "Search helper returned invalid text.", "Update yt-dlp and retry."
     ))?;
-    parse_search_json(json)
+    parse_search_page(json, count)
 }
