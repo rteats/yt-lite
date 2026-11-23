@@ -372,6 +372,79 @@ extractor remains unchanged. The upstream yt-dlp README documents
 
 Follow-up: [issue #30](https://github.com/rteats/yt-lite/issues/30).
 
+## HLS/DASH isolation and large-caption output hypothesis (2026-11-23)
+
+The user ran the `-ManifestOnly` comparison on both videos, with the second
+round's variants in reverse order. In both cases yt-dlp announced exactly
+one **HLS** manifest, not DASH. The results:
+
+| Variant (two-run mean) | `dQw4w9WgXcQ` | `fq-Xn7ZOZtg` | Media kept (original / second) |
+| --- | ---: | ---: | --- |
+| Baseline | 6,104.5 ms | 7,504 ms | 43 / 43 |
+| Skip HLS only | 5,896 ms | 7,676 ms | 28 / 30 |
+| Skip DASH only | 6,389.5 ms | 7,528.5 ms | 43 / 43 |
+| Skip both | 5,731.5 ms | 7,040.5 ms | 28 / 30 |
+
+Skipping HLS removes **15 original-video** and **13 second-video**
+video-only format entries (the muxed format still survives). For the
+first video it also reduces the reported automatic caption formats from
+1,104 to 1,099. For the second video's much larger caption set,
+the count stays unchanged at 23,114. Skipping DASH alone has no
+repeatable speed advantage. The combined skip saves about 373–464 ms
+in this tiny sample, but removes formats required for planned high
+quality / separate-track playback. **Reject both for the default.**
+
+An important new observation: the second video's `automatic_captions`
+contains **23,114 format entries** versus **1,104** for the first
+video (about 20.9×), despite both having 43 media formats. The longer
+post-manifest tail may be influenced by the cost of generating,
+serializing, transferring or parsing this much metadata. This is
+**only a hypothesis**; caption count alone does not measure processing
+cost. The player currently requests the complete `--dump-single-json`
+even though the native proof only uses the video title and a muxed
+stream at startup.
+
+### Safe output-size experiment
+
+The benchmark now supports `-OutputOnly`. It retains the same
+yt-dlp extraction, **including HLS and DASH processing**, and varies
+only the JSON that yt-dlp prints:
+
+- `full_infojson`: existing `--dump-single-json`
+- `formats_only`: a documented yt-dlp output template that prints
+  `id`, `title`, and the complete `formats` array as JSON
+- `formats_captions`: the same projection but also prints
+  `automatic_captions` for comparison
+
+```powershell
+git switch feat/native-watch-shell-05
+git pull --ff-only
+
+powershell.exe -NoProfile -File .\experiments\native-player\bench-yt-dlp.ps1 -OutputOnly -Repetitions 2
+
+powershell.exe -NoProfile -File .\experiments\native-player\bench-yt-dlp.ps1 -OutputOnly -Repetitions 2 -Url "https://www.youtube.com/watch?v=fq-Xn7ZOZtg"
+```
+
+New columns `OutputKiB`, `ParseMs`, and `FormatsSha` distinguish
+process/output collection time from PowerShell JSON parsing time and
+confirm that the same format descriptors are present. The digest
+contains only format ID, codec and height fields, **not URLs**.
+`AutoCaptions` will be **blank** for `formats_only` by design:
+this output omits caption metadata; it does not prove captions were
+not discovered by the extractor.
+
+The print-template feature is documented in yt-dlp's output template
+reference (e.g. `%(.{id,title})s` and the `j` JSON conversion).
+The experiment does not change the player's real extraction output,
+video resolution, requests, caching, or stream selection. Only if a
+reliable improvement appears without losing any *format IDs* should
+we consider a separate lightweight watch-playback extraction response,
+while retaining complete capability extraction for subtitles and
+chapters on demand. This would need its own real Windows playback
+tests before adoption.
+
+Track results in [issue #30](https://github.com/rteats/yt-lite/issues/30).
+
 ## Provider policy
 
 **Automatic native playback** now prefers `yt-dlp`, the only provider
