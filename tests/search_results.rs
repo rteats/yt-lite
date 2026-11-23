@@ -43,3 +43,19 @@ fn empty_results_are_not_an_error_and_invalid_documents_are() {
     assert!(parse_search_json("[]").is_err());
     assert!(parse_search_json("this is not json").is_err());
 }
+
+#[test]
+fn search_can_request_more_than_eight_results_and_limits_work() {
+    use yt_lite_extraction_proof::{search_target, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
+    assert_eq!(SEARCH_BATCH_SIZE, 8);
+    assert_eq!(search_target("  rust tutorials  ", 16).unwrap(), "ytsearch16:rust tutorials");
+    assert!(search_target("test", 0).is_err());
+    assert!(search_target("test", SEARCH_MAX_RESULTS + 1).is_err());
+    let entries = (0..50)
+        .map(|i| format!(r#"{{"id":"v{i:010}","title":"Video {i}"}}"#))
+        .collect::<Vec<_>>().join(",");
+    let json = format!(r#"{{"entries":[{entries}]}}"#);
+    let parsed = parse_search_json(&json).unwrap();
+    assert_eq!(parsed.len(), SEARCH_MAX_RESULTS);
+    assert_eq!(parsed[15].title, "Video 15");
+}
