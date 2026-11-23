@@ -794,12 +794,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Decode small JPEG/PNG thumbnails only after they reach the UI thread.
         if let Some(rx) = thumbnail_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Some(bytes)) => {
+                Ok(Some(pixels)) => {
                     if let Some(ui) = label_window.upgrade() {
-                        if let Ok(image) = slint::Image::load_from_data(&bytes, None) {
-                            ui.set_video_thumbnail(image);
-                            ui.set_has_thumbnail(true);
-                        }
+                        ui.set_video_thumbnail(slint::Image::from_rgb8(pixels));
+                        ui.set_has_thumbnail(true);
                     }
                     thumbnail_receiver = None;
                 }
