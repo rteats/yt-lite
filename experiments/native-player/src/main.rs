@@ -8,7 +8,7 @@ use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract_playback, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
-use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_playback_streams, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
+use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, select_playback_streams, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
 
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox, LineEdit, ListView, Palette } from "std-widgets.slint";
@@ -310,6 +310,8 @@ fn time_label(seconds: f64) -> String {
 struct ResolvedStream {
     url: String,
     audio_url: Option<String>,
+    fallback_muxed: Option<(String, HttpPlaybackHeaders)>,
+    selected_height: Option<u64>,
     watch: WatchMetadata,
     provider: Provider,
     headers: HttpPlaybackHeaders,
@@ -336,17 +338,24 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 let selected = select_playback_streams(&info).ok_or_else(|| {
                     "No playable audio+video tracks with compatible HTTP settings. Retry or open in Browser.".to_string()
                 })?;
-                let (url, audio_url, headers) = match selected {
+                let (url, audio_url, headers, selected_height, fallback_muxed) = match selected {
                     PlaybackStreamSelection::Muxed(stream) => (
                         stream.url.clone(), None, stream.http_headers.clone(),
+                        stream.height, None,
                     ),
                     PlaybackStreamSelection::Separate { video, audio } => (
                         video.url.clone(), Some(audio.url.clone()), video.http_headers.clone(),
+                        video.height,
+                        select_muxed_stream(&info).map(|muxed|
+                            (muxed.url.clone(), muxed.http_headers.clone())
+                        ),
                     ),
                 };
                 Ok(ResolvedStream {
                     url,
                     audio_url,
+                    fallback_muxed,
+                    selected_height,
                     watch: present_watch_metadata(&info),
                     provider,
                     headers,
@@ -678,6 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_advanced = false;
     let mut has_network_media = false;
     let mut pending_external_audio: Option<String> = None;
+    let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
         if let Some(query) = search_requested.borrow_mut().take() {
@@ -836,6 +846,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     playback_advanced = false;
                     has_network_media = false;
                     pending_external_audio = None;
+                    fallback_muxed = None;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_url(true);
                         ui.set_has_media(false);
@@ -983,9 +994,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 thumbnail_receiver = Some(spawn_thumbnail(id));
                             }
                         }
+                        if let Some(height) = stream.selected_height {
+                            let mode = if stream.audio_url.is_some() { "separate A/V" } else { "combined A/V" };
+                            eprintln!("[yt-lite] selected {height}p {mode} for automatic quality");
+                        }
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
                         match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
                             Ok(()) => {
+                                fallback_muxed = stream.fallback_muxed;
                                 pending_external_audio = stream.audio_url;
                                 load_started = Some(Instant::now());
                                 file_loaded = false;
@@ -1002,9 +1018,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(err) = failure {
-            // Runtime failures (HTTP 403, expired signatures, etc.) are distinct
-            // from extraction success. Try the other extractor exactly once.
-            if let Some(next) = fallback_after_playback_error(active_provider, requested_provider) {
+            // If high-resolution split A/V failed, use the already-extracted
+            // combined stream before contacting another extractor. Never
+            // persist or log signed CDN URLs.
+            if let Some((url, headers)) = fallback_muxed.take() {
+                eprintln!("[yt-lite] high-quality stream failed: {err}; retrying compatible combined A/V");
+                pending_external_audio = None;
+                let _ = label_player.borrow().send_strings(&["stop".into()]);
+                match label_player.borrow_mut().load_network_stream(&url, &headers) {
+                    Ok(()) => {
+                        load_started = Some(Instant::now());
+                        file_loaded = false;
+                        file_loaded_at = None;
+                        playback_advanced = false;
+                        has_network_media = true;
+                        playback_error = None;
+                    }
+                    Err(error) => {
+                        playback_error = Some(format!("Combined stream fallback failed: {error}"));
+                        load_started = None;
+                        has_network_media = false;
+                        if let Some(ui) = label_window.upgrade() {
+                            ui.set_has_media(false);
+                            ui.set_can_retry(remote_url.is_some());
+                        }
+                    }
+                }
+            // Runtime failures (HTTP 403, expired signatures, etc.) are
+            // distinct from extraction success; other provider is last resort.
+            } else if let Some(next) = fallback_after_playback_error(active_provider, requested_provider) {
                 if let Some(ref url) = remote_url {
                     eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
@@ -1020,6 +1062,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     playback_advanced = false;
                     has_network_media = false;
                     pending_external_audio = None;
+                    fallback_muxed = None;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_media(false);
                         ui.set_can_retry(false);
