@@ -185,3 +185,42 @@ fn unknown_video_height_does_not_outrank_known_hd_video() {
     assert!(matches!(select_playback_streams(&info),
         Some(PlaybackStreamSelection::Separate { video, .. }) if video.format_id == "hd"));
 }
+
+#[test]
+fn direct_http_audio_is_preferred_to_manifest_audio_and_header_mismatch() {
+    use yt_lite_native_player_proof::{select_playback_streams, PlaybackStreamSelection};
+    let doc = r#"{"id":"dQw4w9WgXcQ","title":"Fixture","formats":[
+      {"format_id":"video","url":"https://example.test/video","protocol":"https","height":1080,"vcodec":"avc1","acodec":"none"},
+      {"format_id":"manifest","url":"https://example.test/hls","protocol":"m3u8_native","vcodec":"none","acodec":"mp4a"},
+      {"format_id":"direct_low","url":"https://example.test/low","protocol":"https","vcodec":"none","acodec":"mp4a"},
+      {"format_id":"direct_high","url":"https://example.test/high","protocol":"https","vcodec":"none","acodec":"opus"},
+      {"format_id":"incompatible","url":"https://example.test/incompatible","protocol":"https","vcodec":"none","acodec":"opus","http_headers":{"Referer":"https://other.example/"}}
+    ]}"#;
+    let info = parse_provider_json(Provider::YtDlp, ID, doc).unwrap();
+    assert!(matches!(select_playback_streams(&info),
+        Some(PlaybackStreamSelection::Separate { audio, .. }) if audio.format_id == "direct_high"));
+}
+
+#[test]
+fn audio_clock_warning_requires_real_video_progress_after_audio_was_running() {
+    use yt_lite_native_player_proof::AudioContinuity;
+    let mut monitor = AudioContinuity::default();
+    assert!(!monitor.sample(Some(0.0), None, true));
+    assert!(!monitor.sample(Some(1.0), Some(1.0), true));
+    assert!(!monitor.sample(Some(2.0), Some(2.0), true));
+    assert!(!monitor.sample(Some(3.0), Some(2.0), true));
+    assert!(!monitor.sample(Some(4.0), None, true));
+    assert!(monitor.sample(Some(5.0), None, true));
+    assert!(!monitor.sample(Some(5.0), None, false));
+    assert!(!monitor.sample(Some(30.0), Some(30.0), true));
+    assert!(!monitor.sample(Some(31.0), Some(31.0), true));
+}
+
+#[test]
+fn audio_clock_monitor_does_not_treat_unsupported_property_as_proven_loss() {
+    use yt_lite_native_player_proof::AudioContinuity;
+    let mut monitor = AudioContinuity::default();
+    for i in 0..10 {
+        assert!(!monitor.sample(Some(i as f64), None, true));
+    }
+}

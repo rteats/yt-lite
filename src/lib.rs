@@ -49,6 +49,8 @@ pub struct Stream {
     pub width: Option<u64>,
     pub height: Option<u64>,
     pub fps: Option<f64>,
+    #[serde(default)]
+    pub protocol: Option<String>,
     pub has_video: bool,
     pub has_audio: bool,
     #[serde(default)]
@@ -248,7 +250,7 @@ fn formats(root: &Value) -> Capability<Stream> {
         // must not be advertised as selectable audio/video streams.
         if !has_video && !has_audio { return None; }
         Some(Stream { format_id, url, width: integer(&v["width"]), height: integer(&v["height"]),
-            fps: number(&v["fps"]), has_video, has_audio,
+            fps: number(&v["fps"]), protocol: string(&v["protocol"]), has_video, has_audio,
             http_headers: playback_http_headers(root, v) })
     }).collect::<Vec<_>>();
     if items.is_empty() { Capability::Unavailable } else { Capability::Available(items) }

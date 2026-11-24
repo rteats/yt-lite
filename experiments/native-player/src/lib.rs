@@ -61,6 +61,16 @@ pub enum PlaybackStreamSelection<'a> {
 /// separate-video candidate; manual quality controls belong to issue #10.
 pub const AUTO_PREFERRED_MAX_HEIGHT: u64 = 1080;
 
+// Prefer a direct HTTP demuxer input over manifest-backed streams when
+// choosing otherwise comparable tracks. Unknown protocol is not rejected.
+fn directness(stream: &yt_lite_extraction_proof::Stream) -> u8 {
+    match stream.protocol.as_deref() {
+        Some("http" | "https") => 2,
+        None => 1,
+        Some(_) => 0,
+    }
+}
+
 pub fn select_playback_streams(
     info: &yt_lite_extraction_proof::ExtractionResult,
 ) -> Option<PlaybackStreamSelection<'_>> {
@@ -80,12 +90,15 @@ pub fn select_playback_streams(
             let audio = streams.iter()
                 .filter(|s| s.has_audio && !s.has_video)
                 .filter(http)
-                .find(|audio| audio.http_headers == video.http_headers)?;
+                .filter(|audio| audio.http_headers == video.http_headers)
+                // yt-dlp orders formats worst to best; max_by_key retains
+                // the last candidate on ties, preserving provider ranking.
+                .max_by_key(|audio| directness(audio))?;
             Some((video, audio))
         })
         .max_by_key(|(video, _)| {
             let height = video.height.unwrap_or(0);
-            (height > 0 && height <= AUTO_PREFERRED_MAX_HEIGHT, height, video.width.unwrap_or(0))
+            (height > 0 && height <= AUTO_PREFERRED_MAX_HEIGHT, height, directness(video), video.width.unwrap_or(0))
         });
     match (muxed, split) {
         (Some(muxed), Some((video, audio)))
@@ -206,4 +219,39 @@ pub fn search_margin_ratio(width_px: u32, scale_factor: f32, show_search: bool) 
         f64::from(scale_factor)
     } else { 1.0 };
     (370.0 * scale / f64::from(width_px)).min(0.65)
+}
+
+/// Clock-based diagnostic only. Detect sustained video progress without
+/// corresponding audio-clock progress, after audio has actually initialized.
+/// Never infer silence from a muted/paused/seeking/buffering player or EOF.
+#[derive(Default)]
+pub struct AudioContinuity {
+    previous: Option<(f64, Option<f64>)>,
+    seen_audio: bool,
+    stagnant: f64,
+}
+
+impl AudioContinuity {
+    pub fn sample(&mut self, video: Option<f64>, audio: Option<f64>, active: bool) -> bool {
+        if !active || video.is_none() {
+            self.previous = None;
+            self.stagnant = 0.0;
+            return false;
+        }
+        let video = video.unwrap();
+        let current = (video, audio);
+        if let Some((last_video, last_audio)) = self.previous.replace(current) {
+            let advance = video - last_video;
+            let audio_advanced = matches!((last_audio, audio),
+                (Some(a), Some(b)) if b - a > 0.05);
+            if audio_advanced { self.seen_audio = true; }
+            // Large jumps and backwards movement are seeks or discontinuities.
+            if !(0.05..=2.0).contains(&advance) || audio_advanced {
+                self.stagnant = 0.0;
+            } else if self.seen_audio {
+                self.stagnant += advance;
+            }
+        }
+        self.stagnant >= 3.0
+    }
 }

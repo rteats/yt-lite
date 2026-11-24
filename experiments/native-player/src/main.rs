@@ -8,7 +8,7 @@ use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract_playback_with_ejs, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
-use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, select_playback_streams, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
+use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, select_playback_streams, AudioContinuity, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
 
 slint::slint! {
     import { Button, HorizontalBox, VerticalBox, LineEdit, ListView, Palette } from "std-widgets.slint";
@@ -313,6 +313,8 @@ struct ResolvedStream {
     fallback_muxed: Option<(String, HttpPlaybackHeaders)>,
     selected_height: Option<u64>,
     used_native_ejs: bool,
+    video_format: String,
+    audio_format: Option<String>,
     watch: WatchMetadata,
     provider: Provider,
     headers: HttpPlaybackHeaders,
@@ -348,6 +350,10 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 let selected = select_playback_streams(&info).ok_or_else(|| {
                     "No playable audio+video tracks with compatible HTTP settings. Retry or open in Browser.".to_string()
                 })?;
+                let (video_format, audio_format) = match &selected {
+                    PlaybackStreamSelection::Muxed(stream) => (stream.format_id.clone(), None),
+                    PlaybackStreamSelection::Separate { video, audio } => (video.format_id.clone(), Some(audio.format_id.clone())),
+                };
                 let (url, audio_url, headers, selected_height, fallback_muxed) = match selected {
                     PlaybackStreamSelection::Muxed(stream) => (
                         stream.url.clone(), None, stream.http_headers.clone(),
@@ -367,6 +373,8 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                     fallback_muxed,
                     selected_height,
                     used_native_ejs,
+                    video_format,
+                    audio_format,
                     watch: present_watch_metadata(&info),
                     provider,
                     headers,
@@ -710,6 +718,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_external_audio: Option<String> = None;
     let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let mut used_native_ejs = false;
+    let mut audio_monitor = AudioContinuity::default();
+    let mut audio_warning = false;
+    let mut next_audio_sample = Instant::now();
+    let mut next_audio_log = Instant::now();
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
         if let Some(query) = search_requested.borrow_mut().take() {
@@ -881,6 +893,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending_external_audio = None;
                     fallback_muxed = None;
                     used_native_ejs = false;
+                    audio_monitor = AudioContinuity::default();
+                    audio_warning = false;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_url(true);
                         ui.set_has_media(false);
@@ -1013,6 +1027,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(stream) => {
                         active_provider = stream.provider;
                         used_native_ejs = stream.used_native_ejs;
+                        audio_monitor = AudioContinuity::default();
+                        audio_warning = false;
+                        next_audio_sample = Instant::now();
+                        next_audio_log = Instant::now();
+                        if profile_timings {
+                            // Format IDs are short provider labels, not URLs.
+                            let safe = |id: &str| -> String {
+                                if id.len() <= 48 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+                                    id.to_owned()
+                                } else { "redacted".into() }
+                            };
+                            eprintln!("[yt-lite] format video={} audio={}", safe(&stream.video_format),
+                                stream.audio_format.as_deref().map(safe).unwrap_or_else(|| "muxed".into()));
+                        }
                         if profile_timings {
                             let label = if used_native_ejs { "yt-dlp-native-ejs-requested" } else { provider_label(stream.provider) };
                             eprintln!("[yt-lite] timing {}-extract={}ms", label, stream.extraction_ms);
@@ -1057,6 +1085,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // If high-resolution split A/V failed, use the already-extracted
             // combined stream before contacting another extractor. Never
             // persist or log signed CDN URLs.
+            audio_monitor = AudioContinuity::default();
+            audio_warning = false;
             if let Some((url, headers)) = fallback_muxed.take() {
                 eprintln!("[yt-lite] high-quality stream failed: {err}; retrying compatible combined A/V");
                 pending_external_audio = None;
@@ -1178,7 +1208,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_fraction(fraction as f32);
             let title = media_title.as_deref().unwrap_or("Local video");
             let buffering = file_loaded && player.property_flag(c"paused-for-cache").unwrap_or(false);
-            let prefix = if buffering { "Buffering | " } else { "" };
+            // Inspect clock/decoder/output state at most once per second,
+            // outside the rendering callback. No raw mpv logs or signed URLs.
+            if has_network_media && file_loaded && Instant::now() >= next_audio_sample {
+                next_audio_sample = Instant::now() + Duration::from_secs(1);
+                let audio_pts = player.property_double(c"audio-pts");
+                let decoder_rate = player.property_double(c"audio-params/samplerate");
+                let output_rate = player.property_double(c"audio-out-params/samplerate");
+                let paused = player.property_flag(c"pause").unwrap_or(false);
+                let seeking = player.property_flag(c"seeking").unwrap_or(false);
+                let muted = player.property_flag(c"mute").unwrap_or(false);
+                let eof = player.property_flag(c"eof-reached").unwrap_or(false);
+                let near_end = duration > 0.0 && duration - elapsed < 3.0;
+                let old_warning = audio_warning;
+                audio_warning = audio_monitor.sample(Some(elapsed), audio_pts,
+                    !paused && !seeking && !buffering && !muted && !eof && !near_end);
+                if old_warning != audio_warning {
+                    eprintln!("[yt-lite] audio clock {} at {:.1}s", if audio_warning { "stalled" } else { "warning cleared" }, elapsed);
+                    ui.set_can_retry(audio_warning && remote_url.is_some());
+                }
+                if profile_timings && (old_warning != audio_warning || Instant::now() >= next_audio_log) {
+                    next_audio_log = Instant::now() + Duration::from_secs(10);
+                    eprintln!("[yt-lite] av-state pos={elapsed:.2} audio_pts={audio_pts:?} decoder_hz={decoder_rate:?} output_hz={output_rate:?} seeking={seeking} buffering={buffering} paused={paused} muted={muted} eof={eof}");
+                }
+            }
+            let prefix = if buffering { "Buffering | " } else if audio_warning { "Audio clock stalled — Retry | " } else { "" };
             ui.set_status(format!("{prefix}{title}  |  {} / {}", time_label(elapsed), time_label(duration)).into());
             ui.set_paused(player.property_flag(c"pause").unwrap_or(false));
         }
