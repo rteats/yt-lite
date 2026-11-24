@@ -7,7 +7,7 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract_playback_traced, trace_event, trace_id, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback_attempt, trace_event, trace_id, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, select_playback_streams, AudioContinuity, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
 
 slint::slint! {
@@ -313,6 +313,7 @@ struct ResolvedStream {
     fallback_muxed: Option<(String, HttpPlaybackHeaders)>,
     selected_height: Option<u64>,
     used_native_ejs: bool,
+    used_fast_extraction: bool,
     trace: Option<u64>,
     video_format: String,
     audio_format: Option<String>,
@@ -327,7 +328,7 @@ type StreamResolution = Result<ResolvedStream, String>;
 /// Fetch metadata off the UI thread, preferring a muxed stream. If the
 /// video only offers separate A/V formats, keep both URLs inside this worker
 /// response for libmpv to stream independently. No video is downloaded.
-fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool, native_ejs: Option<PathBuf>, profile_timings: bool) -> Receiver<StreamResolution> {
+fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool, native_ejs: Option<PathBuf>, profile_timings: bool, fast_extraction: bool) -> Receiver<StreamResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let extraction_started = Instant::now();
@@ -338,16 +339,18 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
             runtime.block_on(async {
                 let mut used_native_ejs = provider == Provider::YtDlp && native_ejs.is_some();
+                let mut used_fast_extraction = provider == Provider::YtDlp && fast_extraction;
                 let solver = if used_native_ejs { native_ejs.as_deref() } else { None };
                 let mut trace = profile_timings.then(trace_id);
-                let mut attempt = extract_playback_traced(&video_url, provider, &helper, lean_metadata, solver, trace).await;
+                let mut attempt = extract_playback_attempt(&video_url, provider, &helper, lean_metadata, solver, trace, used_fast_extraction).await;
                 // A zero exit code is not sufficient: a solver failure may
                 // leave only unusable formats in the returned metadata.
-                if used_native_ejs && !attempt.as_ref().ok().is_some_and(|info| select_playback_streams(info).is_some()) {
-                    eprintln!("[yt-lite] native EJS attempt failed or returned no playable pair; retrying standard yt-dlp");
+                if (used_native_ejs || used_fast_extraction) && !attempt.as_ref().ok().is_some_and(|info| select_playback_streams(info).is_some()) {
+                    eprintln!("[yt-lite] experimental extraction failed or returned no playable pair; retrying standard yt-dlp");
                     used_native_ejs = false;
+                    used_fast_extraction = false;
                     trace = profile_timings.then(trace_id);
-                    attempt = extract_playback_traced(&video_url, provider, &helper, lean_metadata, None, trace).await;
+                    attempt = extract_playback_attempt(&video_url, provider, &helper, lean_metadata, None, trace, false).await;
                 }
                 let info = attempt.map_err(|error| format!("{} {}", error.message, error.action))?;
                 let selected = select_playback_streams(&info).ok_or_else(|| {
@@ -376,6 +379,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                     fallback_muxed,
                     selected_height,
                     used_native_ejs,
+                    used_fast_extraction,
                     trace,
                     video_format,
                     audio_format,
@@ -491,11 +495,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut requested_provider = Provider::Auto;
     let mut profile_timings = false;
     let mut lean_metadata = false;
+    let mut fast_extraction = false;
     let mut native_ejs: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--timings" => profile_timings = true,
             "--lean-metadata" => lean_metadata = true,
+            "--fast-extraction" => fast_extraction = true,
             "--native-ejs" => {
                 let path = PathBuf::from(args.next().ok_or("Missing --native-ejs PATH")?);
                 let path = path.canonicalize().map_err(|_| "Native EJS executable does not exist")?;
@@ -514,6 +520,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ if source.is_none() => source = Some(arg),
             _ => return Err("Only one media source may be supplied".into()),
         }
+    }
+    if fast_extraction && native_ejs.is_some() {
+        return Err("Benchmark --fast-extraction and --native-ejs separately".into());
+    }
+    if fast_extraction {
+        eprintln!("[yt-lite] experimental fast extraction enabled (standard fallback retained)");
     }
     // Reduced output is experimental and affects yt-dlp metadata only.
     // Full output remains the default for captions/chapters compatibility.
@@ -536,7 +548,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(path), None)
     };
     let initial_provider = preferred_playback_provider(requested_provider);
-    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata, native_ejs.clone(), profile_timings));
+    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata, native_ejs.clone(), profile_timings, fast_extraction));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
@@ -739,6 +751,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_external_audio: Option<String> = None;
     let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let mut used_native_ejs = false;
+    let mut used_fast_extraction = false;
     let mut audio_monitor = AudioContinuity::default();
     let mut audio_warning = false;
     let mut next_audio_sample = Instant::now();
@@ -908,7 +921,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // even if the previous video was left paused.
                     let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
                     active_provider = preferred_playback_provider(requested_provider);
-                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata, native_ejs.clone(), profile_timings));
+                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata, native_ejs.clone(), profile_timings, fast_extraction));
                     pending = None;
                     resolving = true;
                     remote_url = Some(canonical.clone());
@@ -925,6 +938,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending_external_audio = None;
                     fallback_muxed = None;
                     used_native_ejs = false;
+                    used_fast_extraction = false;
                     audio_monitor = AudioContinuity::default();
                     audio_warning = false;
                     active_trace = None;
@@ -1079,6 +1093,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         previous_wait_state = None;
                         active_provider = stream.provider;
                         used_native_ejs = stream.used_native_ejs;
+                        used_fast_extraction = stream.used_fast_extraction;
                         audio_monitor = AudioContinuity::default();
                         audio_warning = false;
                         next_audio_sample = Instant::now();
@@ -1094,7 +1109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 stream.audio_format.as_deref().map(safe).unwrap_or_else(|| "muxed".into()));
                         }
                         if profile_timings {
-                            let label = if used_native_ejs { "yt-dlp-native-ejs-requested" } else { provider_label(stream.provider) };
+                            let label = if used_fast_extraction { "yt-dlp-fast" } else if used_native_ejs { "yt-dlp-native-ejs-requested" } else { provider_label(stream.provider) };
                             eprintln!("[yt-lite] timing {}-extract={}ms", label, stream.extraction_ms);
                         }
                         media_title = Some(stream.watch.title.clone());
@@ -1164,7 +1179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         load_started = None;
                         file_loaded = false;
                         has_network_media = false;
-                        if used_native_ejs {
+                        if used_native_ejs || used_fast_extraction {
                             // A synchronous load failure must also reach the
                             // ordinary-runtime retry, not bypass it.
                             pending = Some(Err(message));
@@ -1174,20 +1189,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if let Some(ui) = label_window.upgrade() {
                             ui.set_has_media(false);
-                            ui.set_can_retry(!used_native_ejs && remote_url.is_some());
+                            ui.set_can_retry(!used_native_ejs && !used_fast_extraction && remote_url.is_some());
                         }
                     }
                 }
             // Runtime failures (HTTP 403, expired signatures, etc.) are
             // distinct from extraction success; other provider is last resort.
-            } else if used_native_ejs && remote_url.is_some() {
+            } else if (used_native_ejs || used_fast_extraction) && remote_url.is_some() {
                 // Split/muxed candidates produced by the experimental solver
                 // failed to open. Resolve once using the ordinary runtime.
                 used_native_ejs = false;
+                used_fast_extraction = false;
                 let url = remote_url.as_ref().unwrap().clone();
-                eprintln!("[yt-lite] native EJS media failed; retrying standard yt-dlp");
+                eprintln!("[yt-lite] experimental media failed; retrying standard yt-dlp");
                 let _ = label_player.borrow().send_strings(&["stop".into()]);
-                receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, lean_metadata, None, profile_timings));
+                receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, lean_metadata, None, profile_timings, false));
                 pending = None;
                 resolving = true;
                 load_started = None;
@@ -1205,7 +1221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref url) = remote_url {
                     eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
-                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata, None, profile_timings));
+                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata, None, profile_timings, false));
                     active_provider = next;
                     pending = None;
                     resolving = true;
@@ -1219,6 +1235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending_external_audio = None;
                     fallback_muxed = None;
                     used_native_ejs = false;
+                    used_fast_extraction = false;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_media(false);
                         ui.set_can_retry(false);

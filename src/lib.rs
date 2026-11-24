@@ -424,6 +424,7 @@ async fn yt_dlp_extract(
     lean_metadata: bool,
     native_ejs: Option<&Path>,
     trace: Option<u64>,
+    fast: bool,
 ) -> Result<ExtractionResult, ProbeError> {
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true)
@@ -438,7 +439,14 @@ async fn yt_dlp_extract(
         cmd.args(["--no-plugin-dirs", "--no-js-runtimes", "--js-runtimes"]).arg(runtime);
     }
     if trace.is_some() { cmd.arg("--verbose"); }
-    cmd.args(["--socket-timeout", "10", "--", url]);
+    if fast {
+        // Experimental playback-only path; the caller owns standard fallback.
+        // The TV player variant is a temporary upstream solver workaround.
+        cmd.args(["--socket-timeout", "2.5", "--extractor-args", "youtube:player_js_variant=tv;skip=hls"]);
+    } else {
+        cmd.args(["--socket-timeout", "10"]);
+    }
+    cmd.args(["--", url]);
     let run = async {
         if let Some(id) = trace { traced_helper(&mut cmd, id).await }
         else { cmd.output().await.map(|output| (output.status, output.stdout)) }
@@ -496,15 +504,24 @@ pub async fn extract_playback_traced(
     url: &str, selected: Provider, helper: &Path, lean_metadata: bool,
     native_ejs: Option<&Path>, trace: Option<u64>,
 ) -> Result<ExtractionResult, ProbeError> {
+    extract_playback_attempt(url, selected, helper, lean_metadata, native_ejs, trace, false).await
+}
+
+/// Single playback extraction attempt. Fast mode is opt-in and callers must
+/// retry standard extraction if the result cannot actually be played.
+pub async fn extract_playback_attempt(
+    url: &str, selected: Provider, helper: &Path, lean_metadata: bool,
+    native_ejs: Option<&Path>, trace: Option<u64>, fast: bool,
+) -> Result<ExtractionResult, ProbeError> {
     let (id, canonical) = canonical_video_url(url)?;
-    if let Some(trace_id) = trace { trace_event("extract_begin", format_args!("id={trace_id} video={id} provider={selected:?} native_ejs={}", native_ejs.is_some())); }
+    if let Some(trace_id) = trace { trace_event("extract_begin", format_args!("id={trace_id} video={id} provider={selected:?} native_ejs={} fast={fast}", native_ejs.is_some())); }
     let started = Instant::now();
     let result = match selected {
         Provider::Rust => rust_extract(&canonical, &id).await,
-        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace).await,
+        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace, fast).await,
         Provider::Auto => match rust_extract(&canonical, &id).await {
             Ok(result) if matches!(&result.streams, Capability::Available(_)) => Ok(result),
-            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace).await,
+            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace, fast).await,
         },
     };
     if let Some(id) = trace { trace_event("extract_end", format_args!("id={id} elapsed_ms={} success={}", started.elapsed().as_millis(), result.is_ok())); }
