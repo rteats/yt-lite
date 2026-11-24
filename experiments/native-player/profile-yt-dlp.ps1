@@ -7,6 +7,7 @@ param(
     [ValidatePattern('^[A-Za-z0-9_-]{11}$')] [string] $VideoId = 'dQw4w9WgXcQ',
     [string] $YtDlp = '',
     [ValidateRange(1, 5)] [int] $Repetitions = 2,
+    [string] $NativeEjs = '',
     [switch] $SelfTest
 )
 
@@ -64,7 +65,17 @@ if (-not $YtDlp) {
 $executable = (Get-Item -LiteralPath $YtDlp -ErrorAction Stop).FullName
 $watchUrl = 'https://www.youtube.com/watch?v=' + $VideoId
 
+$variants = @('default')
+$solverPath = $null
+if ($NativeEjs) {
+    $solverPath = (Get-Item -LiteralPath $NativeEjs -ErrorAction Stop).FullName
+    if (-not (Test-Path -LiteralPath $solverPath -PathType Leaf)) { throw 'Native EJS must be a file' }
+    $variants = @('deno', 'native_ejs')
+}
 for ($round = 1; $round -le $Repetitions; $round++) {
+    $order = @($variants)
+    if ($round % 2 -eq 0) { [array]::Reverse($order) }
+    foreach ($variant in $order) {
     # This is only a CLI startup proxy. --version may bypass extractor
     # initialization; it is NOT an exact decomposition of extraction time.
     $versionTimer = [Diagnostics.Stopwatch]::StartNew()
@@ -82,8 +93,14 @@ for ($round = 1; $round -le $Repetitions; $round++) {
     $psi.FileName = $executable
     # Video ID is constrained to 11 safe characters, so the URL cannot
     # insert shell arguments or command-line switches.
+    $runtimeArgs = ''
+    if ($variant -eq 'deno') {
+        $runtimeArgs = '--no-plugin-dirs --no-js-runtimes --js-runtimes deno '
+    } elseif ($variant -eq 'native_ejs') {
+        $runtimeArgs = '--no-plugin-dirs --no-js-runtimes --js-runtimes "quickjs:' + $solverPath + '" '
+    }
     $psi.Arguments = ('--ignore-config --no-playlist --no-warnings --skip-download ' +
-        '--dump-single-json --socket-timeout 10 --verbose -- "' + $watchUrl + '"')
+        '--dump-single-json --socket-timeout 10 --verbose ' + $runtimeArgs + '-- "' + $watchUrl + '"')
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -91,6 +108,7 @@ for ($round = 1; $round -le $Repetitions; $round++) {
     $process.StartInfo = $psi
 
     $milestones = @{}
+    $solverObserved = $false
     $jsSignals = 0
     $apiSignals = 0
     $manifestSignals = 0
@@ -100,6 +118,11 @@ for ($round = 1; $round -le $Repetitions; $round++) {
     $result = 'failed'
     $formats = $null
     $muxed = $null
+    $formatDigest = $null
+    $videoOnly = $null
+    $audioOnly = $null
+    $autoCaptions = $null
+    $chapters = $null
     $watch = [Diagnostics.Stopwatch]::StartNew()
 
     try {
@@ -122,6 +145,10 @@ for ($round = 1; $round -le $Repetitions; $round++) {
             }
             $line = $stderrTask.GetAwaiter().GetResult()
             if ($null -eq $line) { break }
+            if (($variant -eq 'native_ejs' -and $line -match '(?i)\[jsc:quickjs\].*Running QuickJS:') -or
+                ($variant -eq 'deno' -and $line -match '(?i)\[jsc:deno\].*Solving JS challenges using deno')) {
+                $solverObserved = $true
+            }
             $kind = Get-SafeMilestone $line
             if ($kind) {
                 $elapsed = [int] $watch.ElapsedMilliseconds
@@ -164,7 +191,23 @@ for ($round = 1; $round -le $Repetitions; $round++) {
                     $_.vcodec -and $_.vcodec -ne 'none' -and
                     $_.acodec -and $_.acodec -ne 'none'
                 }).Count
-                $result = if ($muxed -gt 0) { 'muxed_available' } else { 'no_muxed_format' }
+                $videoOnly = @($media | Where-Object { $_.vcodec -and $_.vcodec -ne 'none' -and $_.acodec -eq 'none' }).Count
+                $audioOnly = @($media | Where-Object { $_.acodec -and $_.acodec -ne 'none' -and $_.vcodec -eq 'none' }).Count
+                $autoCaptions = 0
+                if ($null -ne $data.automatic_captions) {
+                    foreach ($entry in $data.automatic_captions.PSObject.Properties) {
+                        $autoCaptions += @($entry.Value).Count
+                    }
+                }
+                $chapters = if ($null -ne $data.chapters) { @($data.chapters).Count } else { 0 }
+                $descriptors = @($media | ForEach-Object {
+                    "$($_.format_id)|$($_.vcodec)|$($_.acodec)|$($_.height)"
+                } | Sort-Object) -join "`n"
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $formatDigest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($descriptors))).Replace('-', '').Substring(0, 12)
+                } finally { $sha.Dispose() }
+                $result = if ($muxed -gt 0 -or ($videoOnly -gt 0 -and $audioOnly -gt 0)) { 'media_available' } else { 'no_complete_av' }
             } catch {
                 $result = 'malformed'
             }
@@ -180,6 +223,8 @@ for ($round = 1; $round -le $Repetitions; $round++) {
 
     [pscustomobject]@{
         Round = $round
+        Variant = $variant
+        SolverObserved = if ($variant -ne 'default') { $solverObserved } else { $null }
         VersionMs = if ($versionOk) { [int] $versionTimer.ElapsedMilliseconds } else { $null }
         ExtractMs = [int] $watch.ElapsedMilliseconds
         FirstDebugMs = if ($milestones.ContainsKey('debug')) { $milestones['debug'] } else { $null }
@@ -196,6 +241,12 @@ for ($round = 1; $round -le $Repetitions; $round++) {
         JscSignals = $jsSignals
         Media = $formats
         Muxed = $muxed
+        VideoOnly = $videoOnly
+        AudioOnly = $audioOnly
+        FormatsSha = $formatDigest
+        AutoCaptions = $autoCaptions
+        Chapters = $chapters
         Result = $result
+    }
     }
 }

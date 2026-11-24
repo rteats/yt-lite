@@ -348,12 +348,20 @@ async fn yt_dlp_extract(
     id: &str,
     helper: &Path,
     lean_metadata: bool,
+    native_ejs: Option<&Path>,
 ) -> Result<ExtractionResult, ProbeError> {
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true)
         .args(["--ignore-config", "--no-playlist", "--no-warnings", "--skip-download"])
-        .args(yt_dlp_output_args(lean_metadata))
-        .args(["--socket-timeout", "10", "--", url]);
+        .args(yt_dlp_output_args(lean_metadata));
+    if let Some(solver) = native_ejs {
+        // Use the upstream EJS compatibility executable as the only enabled
+        // JS runtime for this attempt. No shell, auto-install or plugin loading.
+        let mut runtime = std::ffi::OsString::from("quickjs:");
+        runtime.push(solver.as_os_str());
+        cmd.args(["--no-plugin-dirs", "--no-js-runtimes", "--js-runtimes"]).arg(runtime);
+    }
+    cmd.args(["--socket-timeout", "10", "--", url]);
     let output = timeout(Duration::from_secs(45), cmd.output()).await
         .map_err(|_| ProbeError::new("timeout", "yt-dlp exceeded its time limit.", "Retry or choose Rust provider."))?
         .map_err(|_| ProbeError::new("helper_missing", "yt-dlp could not be started.", "Supply --yt-dlp PATH to a compatible local helper."))?;
@@ -381,13 +389,26 @@ pub async fn extract_playback(
     helper: &Path,
     lean_metadata: bool,
 ) -> Result<ExtractionResult, ProbeError> {
+    extract_playback_with_ejs(url, selected, helper, lean_metadata, None).await
+}
+
+/// Optional externally installed, native SWC/QuickJS solver experiment.
+/// The normal public extraction API and its default runtime are unchanged.
+/// One attempt only: the playback caller is responsible for retry policy.
+pub async fn extract_playback_with_ejs(
+    url: &str,
+    selected: Provider,
+    helper: &Path,
+    lean_metadata: bool,
+    native_ejs: Option<&Path>,
+) -> Result<ExtractionResult, ProbeError> {
     let (id, canonical) = canonical_video_url(url)?;
     match selected {
         Provider::Rust => rust_extract(&canonical, &id).await,
-        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata).await,
+        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs).await,
         Provider::Auto => match rust_extract(&canonical, &id).await {
             Ok(result) if matches!(&result.streams, Capability::Available(_)) => Ok(result),
-            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata).await,
+            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs).await,
         },
     }
 }
