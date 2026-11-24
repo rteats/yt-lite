@@ -211,8 +211,8 @@ fn audio_clock_warning_requires_real_video_progress_after_audio_was_running() {
     assert!(!monitor.sample(Some(3.0), Some(2.0), true));
     assert!(!monitor.sample(Some(4.0), None, true));
     assert!(monitor.sample(Some(5.0), None, true));
-    assert!(!monitor.sample(Some(5.0), None, false));
-    assert!(!monitor.sample(Some(30.0), Some(30.0), true));
+    assert!(monitor.sample(Some(5.0), None, false));
+    assert!(monitor.sample(Some(30.0), Some(30.0), true));
     assert!(!monitor.sample(Some(31.0), Some(31.0), true));
 }
 

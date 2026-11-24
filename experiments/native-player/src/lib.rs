@@ -229,6 +229,7 @@ pub struct AudioContinuity {
     previous: Option<(f64, Option<f64>)>,
     seen_audio: bool,
     stagnant: f64,
+    warning: bool,
 }
 
 impl AudioContinuity {
@@ -236,7 +237,7 @@ impl AudioContinuity {
         if !active || video.is_none() {
             self.previous = None;
             self.stagnant = 0.0;
-            return false;
+            return self.warning;
         }
         let video = video.unwrap();
         let current = (video, audio);
@@ -244,7 +245,7 @@ impl AudioContinuity {
             let advance = video - last_video;
             let audio_advanced = matches!((last_audio, audio),
                 (Some(a), Some(b)) if b - a > 0.05);
-            if audio_advanced { self.seen_audio = true; }
+            if audio_advanced { self.seen_audio = true; self.warning = false; }
             // Large jumps and backwards movement are seeks or discontinuities.
             if !(0.05..=2.0).contains(&advance) || audio_advanced {
                 self.stagnant = 0.0;
@@ -252,6 +253,7 @@ impl AudioContinuity {
                 self.stagnant += advance;
             }
         }
-        self.stagnant >= 3.0
+        if self.stagnant >= 3.0 { self.warning = true; }
+        self.warning
     }
 }

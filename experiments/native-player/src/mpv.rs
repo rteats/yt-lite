@@ -61,11 +61,42 @@ pub enum PlaybackEvent {
     ExternalAudioAdded,
     ExternalAudioFailed(i32),
     Ended,
+    Seek,
+    AudioReconfig,
+    VideoReconfig,
+    Diagnostic(&'static str),
 }
 
 // mpv/client.h: START_FILE=6, END_FILE=7, FILE_LOADED=8,
 // COMMAND_REPLY=5; MPV_END_FILE_REASON_ERROR=4.
 const MPV_EVENT_NONE: c_int = 0;
+const MPV_EVENT_LOG_MESSAGE: c_int = 2;
+const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
+const MPV_EVENT_AUDIO_RECONFIG: c_int = 18;
+const MPV_EVENT_SEEK: c_int = 20;
+
+#[repr(C)]
+struct MpvLogMessage {
+    prefix: *const c_char,
+    level: *const c_char,
+    text: *const c_char,
+    log_level: c_int,
+}
+
+// Classify only; do not print any raw message (may contain signed URLs).
+fn safe_mpv_log(text: &str) -> Option<&'static str> {
+    let s = text.to_ascii_lowercase();
+    if s.contains("timed out") || s.contains("timeout") { Some("network_timeout") }
+    else if s.contains("http error") || s.contains("http response") { Some("http_error_or_response") }
+    else if s.contains("reconnect") { Some("reconnect") }
+    else if s.contains("end of file") || s.contains("eof") { Some("eof_marker") }
+    else if s.contains("seek") && (s.contains("fail") || s.contains("error")) { Some("seek_error") }
+    else if s.contains("seek") { Some("seek_marker") }
+    else if s.contains("audio") && (s.contains("fail") || s.contains("error")) { Some("audio_error") }
+    else if s.contains("buffer") || s.contains("cache") { Some("cache_marker") }
+    else if s.contains("error") || s.contains("failed") { Some("other_error") }
+    else { None }
+}
 const MPV_EVENT_COMMAND_REPLY: c_int = 5;
 const MPV_EVENT_START_FILE: c_int = 6;
 const MPV_EVENT_END_FILE: c_int = 7;
@@ -90,6 +121,7 @@ struct Api {
     render_update: unsafe extern "C" fn(*mut c_void) -> u64,
     render_callback: unsafe extern "C" fn(*mut c_void, RenderUpdate, *mut c_void),
     wait_event: unsafe extern "C" fn(*mut c_void, f64) -> *const MpvEvent,
+    request_log_messages: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
 }
 
 impl Api {
@@ -111,6 +143,7 @@ impl Api {
             render_update: get(library, b"mpv_render_context_update\0")?,
             render_callback: get(library, b"mpv_render_context_set_update_callback\0")?,
             wait_event: get(library, b"mpv_wait_event\0")?,
+            request_log_messages: get(library, b"mpv_request_log_messages\0")?,
         })
     }
 }
@@ -332,6 +365,16 @@ impl Player {
             let event = unsafe { &*ptr };
             if event.event_id == MPV_EVENT_NONE { break; }
             match event.event_id {
+                MPV_EVENT_LOG_MESSAGE if !event.data.is_null() => {
+                    let msg = unsafe { &*event.data.cast::<MpvLogMessage>() };
+                    if !msg.text.is_null() {
+                        let text = unsafe { CStr::from_ptr(msg.text) }.to_string_lossy();
+                        if let Some(kind) = safe_mpv_log(&text) { events.push(PlaybackEvent::Diagnostic(kind)); }
+                    }
+                }
+                MPV_EVENT_SEEK => events.push(PlaybackEvent::Seek),
+                MPV_EVENT_AUDIO_RECONFIG => events.push(PlaybackEvent::AudioReconfig),
+                MPV_EVENT_VIDEO_RECONFIG => events.push(PlaybackEvent::VideoReconfig),
                 MPV_EVENT_START_FILE => events.push(PlaybackEvent::StartFile),
                 MPV_EVENT_FILE_LOADED => events.push(PlaybackEvent::FileLoaded),
                 MPV_EVENT_PLAYBACK_RESTART => events.push(PlaybackEvent::PlaybackRestart),
@@ -357,6 +400,11 @@ impl Player {
             }
         }
         events
+    }
+
+    pub fn enable_diagnostics(&self) {
+        let rc = unsafe { (self.api.request_log_messages)(self.handle, c"v".as_ptr()) };
+        if rc < 0 { eprintln!("[yt-lite] mpv verbose diagnostics unavailable code={rc}"); }
     }
 
     pub fn property_double(&self, name: &CStr) -> Option<f64> {

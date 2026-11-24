@@ -7,7 +7,7 @@ mod mpv;
 use mpv::{PlaybackEvent, Player};
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
-use yt_lite_extraction_proof::{canonical_video_url, extract_playback_with_ejs, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
+use yt_lite_extraction_proof::{canonical_video_url, extract_playback_traced, trace_event, trace_id, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
 use yt_lite_native_player_proof::{command_for, fallback_after_playback_error, preferred_playback_provider, present_watch_metadata, public_youtube_thumbnail_url, select_muxed_stream, select_playback_streams, AudioContinuity, PlaybackAction, PlaybackStreamSelection, WatchMetadata};
 
 slint::slint! {
@@ -313,6 +313,7 @@ struct ResolvedStream {
     fallback_muxed: Option<(String, HttpPlaybackHeaders)>,
     selected_height: Option<u64>,
     used_native_ejs: bool,
+    trace: Option<u64>,
     video_format: String,
     audio_format: Option<String>,
     watch: WatchMetadata,
@@ -326,7 +327,7 @@ type StreamResolution = Result<ResolvedStream, String>;
 /// Fetch metadata off the UI thread, preferring a muxed stream. If the
 /// video only offers separate A/V formats, keep both URLs inside this worker
 /// response for libmpv to stream independently. No video is downloaded.
-fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool, native_ejs: Option<PathBuf>) -> Receiver<StreamResolution> {
+fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool, native_ejs: Option<PathBuf>, profile_timings: bool) -> Receiver<StreamResolution> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let extraction_started = Instant::now();
@@ -338,13 +339,15 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
             runtime.block_on(async {
                 let mut used_native_ejs = provider == Provider::YtDlp && native_ejs.is_some();
                 let solver = if used_native_ejs { native_ejs.as_deref() } else { None };
-                let mut attempt = extract_playback_with_ejs(&video_url, provider, &helper, lean_metadata, solver).await;
+                let mut trace = profile_timings.then(trace_id);
+                let mut attempt = extract_playback_traced(&video_url, provider, &helper, lean_metadata, solver, trace).await;
                 // A zero exit code is not sufficient: a solver failure may
                 // leave only unusable formats in the returned metadata.
                 if used_native_ejs && !attempt.as_ref().ok().is_some_and(|info| select_playback_streams(info).is_some()) {
                     eprintln!("[yt-lite] native EJS attempt failed or returned no playable pair; retrying standard yt-dlp");
                     used_native_ejs = false;
-                    attempt = extract_playback_with_ejs(&video_url, provider, &helper, lean_metadata, None).await;
+                    trace = profile_timings.then(trace_id);
+                    attempt = extract_playback_traced(&video_url, provider, &helper, lean_metadata, None, trace).await;
                 }
                 let info = attempt.map_err(|error| format!("{} {}", error.message, error.action))?;
                 let selected = select_playback_streams(&info).ok_or_else(|| {
@@ -373,6 +376,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                     fallback_muxed,
                     selected_height,
                     used_native_ejs,
+                    trace,
                     video_format,
                     audio_format,
                     watch: present_watch_metadata(&info),
@@ -532,7 +536,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(path), None)
     };
     let initial_provider = preferred_playback_provider(requested_provider);
-    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata, native_ejs.clone()));
+    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata, native_ejs.clone(), profile_timings));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
@@ -614,8 +618,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let clip_source = Rc::new(RefCell::new(clip));
     let player = Rc::new(RefCell::new(Player::open()?));
+    if profile_timings { player.borrow().enable_diagnostics(); }
 
-    let seek_started = Rc::new(RefCell::new(None::<Instant>));
+    let seek_started = Rc::new(RefCell::new(None::<(u64, Instant)>));
 
     let controls = player.clone();
     window.on_toggle_pause(move || {
@@ -630,8 +635,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relative_seek_started = seek_started.clone();
     window.on_seek_by(move |seconds| {
         if let Some(command) = command_for(PlaybackAction::SeekRelative(seconds.into())) {
+            let requested = Instant::now();
+            let before = if profile_timings { controls.borrow().property_double(c"time-pos") } else { None };
             match controls.borrow().send_strings(&command) {
-                Ok(()) if profile_timings => *relative_seek_started.borrow_mut() = Some(Instant::now()),
+                Ok(()) if profile_timings => {
+                    let id = trace_id();
+                    if let Some((old, _)) = relative_seek_started.borrow_mut().replace((id, requested)) {
+                        trace_event("seek_superseded", format_args!("id={old} next={id}"));
+                    }
+                    trace_event("seek_requested", format_args!("id={id} mode=relative from={before:?} seconds={seconds} dispatch_us={}", requested.elapsed().as_micros()));
+                }
                 Err(error) => eprintln!("Seek error: {error}"),
                 _ => {}
             }
@@ -645,8 +658,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(command) = command_for(PlaybackAction::SeekFraction {
             fraction: f64::from(fraction), duration_seconds: duration,
         }) {
+            let requested = Instant::now();
+            let before = if profile_timings { controls.borrow().property_double(c"time-pos") } else { None };
             match controls.borrow().send_strings(&command) {
-                Ok(()) if profile_timings => *absolute_seek_started.borrow_mut() = Some(Instant::now()),
+                Ok(()) if profile_timings => {
+                    let id = trace_id();
+                    if let Some((old, _)) = absolute_seek_started.borrow_mut().replace((id, requested)) {
+                        trace_event("seek_superseded", format_args!("id={old} next={id}"));
+                    }
+                    trace_event("seek_requested", format_args!("id={id} mode=absolute from={before:?} fraction={fraction} dispatch_us={}", requested.elapsed().as_micros()));
+                }
                 Err(error) => eprintln!("Scrub error: {error}"),
                 _ => {}
             }
@@ -722,8 +743,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut audio_warning = false;
     let mut next_audio_sample = Instant::now();
     let mut next_audio_log = Instant::now();
+    let mut active_trace: Option<u64> = None;
+    let mut audio_started: Option<Instant> = None;
+    let mut first_audio = false;
+    let mut previous_wait_state = None;
+    let mut last_tick = Instant::now();
     let clock = Timer::default();
     clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        let now = Instant::now();
+        if profile_timings && now.duration_since(last_tick) > Duration::from_millis(500) {
+            trace_event("ui_timer_gap", format_args!("gap_ms={}", now.duration_since(last_tick).as_millis()));
+        }
+        last_tick = now;
         if let Some(query) = search_requested.borrow_mut().take() {
             // Old thumbnails may finish late; never attach to new search rows.
             result_thumbnail_receivers.clear();
@@ -876,7 +907,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // even if the previous video was left paused.
                     let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
                     active_provider = preferred_playback_provider(requested_provider);
-                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata, native_ejs.clone()));
+                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata, native_ejs.clone(), profile_timings));
                     pending = None;
                     resolving = true;
                     remote_url = Some(canonical.clone());
@@ -895,6 +926,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     used_native_ejs = false;
                     audio_monitor = AudioContinuity::default();
                     audio_warning = false;
+                    active_trace = None;
+                    audio_started = None;
+                    first_audio = false;
+                    previous_wait_state = None;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_url(true);
                         ui.set_has_media(false);
@@ -917,13 +952,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Unlike the earlier prototype, consume the mpv event queue. An
         // accepted asynchronous loadfile command does NOT mean media loaded.
         for event in label_player.borrow().poll_events() {
+            if profile_timings {
+                trace_event("mpv_event", format_args!("load={active_trace:?} seek={:?} kind={event:?}", pending_seek_timing.borrow().as_ref().map(|(id, _)| *id)));
+            }
             match event {
+                PlaybackEvent::Diagnostic(_) | PlaybackEvent::Seek | PlaybackEvent::AudioReconfig | PlaybackEvent::VideoReconfig => {}
                 PlaybackEvent::StartFile => {
                     // This may also fire when retrying; do not interpret as playback.
                 }
                 PlaybackEvent::PlaybackRestart => {
                     if profile_timings {
-                        if let Some(start) = pending_seek_timing.borrow_mut().take() {
+                        if let Some((id, start)) = pending_seek_timing.borrow_mut().take() {
+                            trace_event("seek_restart_observed", format_args!("id={id} elapsed_ms={}", start.elapsed().as_millis()));
                             eprintln!("[yt-lite] timing seek-to-playback-restart={}ms", start.elapsed().as_millis());
                         }
                     }
@@ -943,6 +983,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(audio_url) = pending_external_audio.take() {
                             // Add external audio after FILE_LOADED to avoid racing
                             // the asynchronous replace/loadfile operation.
+                            audio_started = Some(Instant::now());
+                            if profile_timings { trace_event("audio_add_requested", format_args!("load={active_trace:?}")); }
                             if let Err(err) = label_player.borrow().add_external_audio(&audio_url) {
                                 failure.get_or_insert(err);
                             } else {
@@ -953,6 +995,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 PlaybackEvent::ExternalAudioAdded => {
+                    if profile_timings { trace_event("audio_add_reply", format_args!("load={active_trace:?} elapsed_ms={:?}", audio_started.map(|t| t.elapsed().as_millis()))); }
                     eprintln!("[yt-lite] separate audio track accepted by libmpv");
                 }
                 PlaybackEvent::ExternalAudioFailed(code) => {
@@ -1025,6 +1068,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolving = false;
                 match response {
                     Ok(stream) => {
+                        active_trace = stream.trace;
+                        audio_started = None;
+                        first_audio = false;
+                        previous_wait_state = None;
                         active_provider = stream.provider;
                         used_native_ejs = stream.used_native_ejs;
                         audio_monitor = AudioContinuity::default();
@@ -1063,6 +1110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("[yt-lite] selected {height}p {mode} for automatic quality");
                         }
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
+                        if profile_timings { trace_event("load_requested", format_args!("load={active_trace:?}")); }
                         match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
                             Ok(()) => {
                                 fallback_muxed = stream.fallback_muxed;
@@ -1087,10 +1135,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // persist or log signed CDN URLs.
             audio_monitor = AudioContinuity::default();
             audio_warning = false;
+            audio_started = None;
+            first_audio = false;
+            previous_wait_state = None;
+            if profile_timings { trace_event("playback_failure", format_args!("load={active_trace:?}")); }
             if let Some((url, headers)) = fallback_muxed.take() {
                 eprintln!("[yt-lite] high-quality stream failed: {err}; retrying compatible combined A/V");
                 pending_external_audio = None;
                 let _ = label_player.borrow().send_strings(&["stop".into()]);
+                if profile_timings { trace_event("muxed_fallback_requested", format_args!("load={active_trace:?}")); }
                 match label_player.borrow_mut().load_network_stream(&url, &headers) {
                     Ok(()) => {
                         load_started = Some(Instant::now());
@@ -1128,7 +1181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let url = remote_url.as_ref().unwrap().clone();
                 eprintln!("[yt-lite] native EJS media failed; retrying standard yt-dlp");
                 let _ = label_player.borrow().send_strings(&["stop".into()]);
-                receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, lean_metadata, None));
+                receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, lean_metadata, None, profile_timings));
                 pending = None;
                 resolving = true;
                 load_started = None;
@@ -1146,7 +1199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref url) = remote_url {
                     eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
-                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata, None));
+                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata, None, profile_timings));
                     active_provider = next;
                     pending = None;
                     resolving = true;
@@ -1181,6 +1234,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_can_retry(remote_url.is_some());
                 }
             }
+        }
+
+        // During startup/seek, sample at the existing 250ms UI tick; during
+        // steady playback report transitions and sparse samples only.
+        if profile_timings && has_network_media {
+            let player = label_player.borrow();
+            let seeking = player.property_flag(c"seeking");
+            let buffering = player.property_flag(c"paused-for-cache");
+            let paused = player.property_flag(c"pause");
+            let audio_pts = player.property_double(c"audio-pts");
+            let state = (seeking, buffering, paused, audio_pts.is_some());
+            let changed = previous_wait_state != Some(state);
+            let waiting = load_started.is_some() || pending_seek_timing.borrow().is_some()
+                || seeking == Some(true) || buffering == Some(true) || !first_audio;
+            if !first_audio && audio_pts.is_some() && file_loaded {
+                first_audio = true;
+                trace_event("audio_pts_first_observed", format_args!("load={active_trace:?} since_add_ms={:?} pts={audio_pts:?}", audio_started.map(|t| t.elapsed().as_millis())));
+            }
+            if changed || waiting || (audio_warning && Instant::now() >= next_audio_log) {
+                trace_event("wait_state", format_args!("load={active_trace:?} seek={:?} pos={:?} audio_pts={audio_pts:?} seeking={seeking:?} buffering={buffering:?} paused={paused:?} cache_s={:?} cache_pct={:?} input_bytes_s={:?} avsync={:?}",
+                    pending_seek_timing.borrow().as_ref().map(|(id, _)| *id),
+                    player.property_double(c"time-pos"),
+                    player.property_double(c"demuxer-cache-duration"),
+                    player.property_double(c"cache-buffering-state"),
+                    player.property_double(c"cache-speed"),
+                    player.property_double(c"avsync")));
+            }
+            previous_wait_state = Some(state);
         }
 
         if let Some(ui) = label_window.upgrade() {

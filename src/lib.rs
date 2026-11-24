@@ -4,7 +4,79 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::Path, time::Duration};
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, time::timeout, io::{AsyncBufReadExt, AsyncReadExt, BufReader}};
+use std::{process::Stdio, sync::{OnceLock, atomic::{AtomicU64, Ordering}}, time::Instant};
+
+static TRACE_START: OnceLock<Instant> = OnceLock::new();
+static TRACE_NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Monotonic process clock shared by the extraction and native player.
+pub fn trace_event(event: &str, details: std::fmt::Arguments<'_>) {
+    let elapsed = TRACE_START.get_or_init(Instant::now).elapsed().as_millis();
+    eprintln!("[yt-lite] trace t_ms={elapsed} event={event} {details}");
+}
+
+pub fn trace_id() -> u64 { TRACE_NEXT.fetch_add(1, Ordering::Relaxed) }
+
+/// Return only fixed categories, never any part of a provider log line.
+pub fn extraction_marker(line: &str) -> Option<&'static str> {
+    let s = line.to_ascii_lowercase();
+    if s.contains("retrying") || s.contains("retrying (") { return Some("retry"); }
+    if s.contains("timed out") || s.contains("timeout") && s.starts_with("warning:") { return Some("timeout_warning"); }
+    if s.starts_with("warning:") { return Some("warning"); }
+    if s.starts_with("error:") { return Some("error"); }
+    if s.contains("running quickjs:") || s.contains("running deno:") ||
+        s.contains("running node:") || s.contains("running bun:") { return Some("runtime_launch"); }
+    if s.contains("solving js challenges") { return Some("js_solve_announced"); }
+    if s.contains("downloading") && s.contains("player api json") { return Some("player_api"); }
+    if s.contains("downloading") && (s.contains("m3u8") || s.contains("mpd") || s.contains("manifest")) { return Some("manifest"); }
+    if s.contains("downloading") && (s.contains("player ") || s.contains("player javascript")) { return Some("player_code"); }
+    if s.contains("downloading webpage") { return Some("webpage"); }
+    if s.contains("downloading") && s.contains("initial data") { return Some("initial_data"); }
+    if s.contains("downloading") && s.contains("client config") { return Some("client_config"); }
+    if s.contains("loading") && s.contains("cache") && s.contains("[debug]") { return Some("cache_lookup"); }
+    if s.contains("[jsc:") { return Some("js_marker"); }
+    if s.starts_with("[debug] loaded ") { return Some("extractors_ready"); }
+    if s.starts_with("[debug]") { return Some("debug"); }
+    None
+}
+
+async fn traced_helper(cmd: &mut Command, id: u64) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    let started = Instant::now();
+     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    trace_event("extract_spawned", format_args!("id={id} elapsed_ms={}", started.elapsed().as_millis()));
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let read_stdout = async {
+        let mut data = Vec::new();
+        let mut first = [0u8; 8192];
+        let n = stdout.read(&mut first).await?;
+        trace_event("extract_stdout_first", format_args!("id={id} elapsed_ms={} bytes={n}", started.elapsed().as_millis()));
+        data.extend_from_slice(&first[..n]);
+        stdout.read_to_end(&mut data).await?;
+        trace_event("extract_stdout_done", format_args!("id={id} elapsed_ms={} bytes={}", started.elapsed().as_millis(), data.len()));
+        Ok::<_, std::io::Error>(data)
+    };
+    let read_stderr = async {
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        let mut seq = 0u64;
+        let mut last = started;
+        while reader.read_until(b'\n', &mut line).await? != 0 {
+            if let Some(kind) = extraction_marker(&String::from_utf8_lossy(&line)) {
+                seq += 1;
+                let now = Instant::now();
+                trace_event("extract_marker", format_args!("id={id} seq={seq} kind={kind} elapsed_ms={} gap_ms={}", started.elapsed().as_millis(), now.duration_since(last).as_millis()));
+                last = now;
+            }
+            line.clear();
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let (status, data, _) = tokio::try_join!(child.wait(), read_stdout, read_stderr)?;
+    trace_event("extract_exit", format_args!("id={id} elapsed_ms={} success={}", started.elapsed().as_millis(), status.success()));
+    Ok((status, data))
+}
 use url::Url;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +423,7 @@ async fn yt_dlp_extract(
     helper: &Path,
     lean_metadata: bool,
     native_ejs: Option<&Path>,
+    trace: Option<u64>,
 ) -> Result<ExtractionResult, ProbeError> {
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true)
@@ -363,17 +436,28 @@ async fn yt_dlp_extract(
         runtime.push(solver.as_os_str());
         cmd.args(["--no-plugin-dirs", "--no-js-runtimes", "--js-runtimes"]).arg(runtime);
     }
+    if trace.is_some() { cmd.arg("--verbose"); }
     cmd.args(["--socket-timeout", "10", "--", url]);
-    let output = timeout(Duration::from_secs(45), cmd.output()).await
-        .map_err(|_| ProbeError::new("timeout", "yt-dlp exceeded its time limit.", "Retry or choose Rust provider."))?
+    let run = async {
+        if let Some(id) = trace { traced_helper(&mut cmd, id).await }
+        else { cmd.output().await.map(|output| (output.status, output.stdout)) }
+    };
+    let (status, stdout) = timeout(Duration::from_secs(45), run).await
+        .map_err(|_| {
+            if let Some(id) = trace { trace_event("extract_timeout", format_args!("id={id}")); }
+            ProbeError::new("timeout", "yt-dlp exceeded its time limit.", "Retry or choose Rust provider.")
+        })?
         .map_err(|_| ProbeError::new("helper_missing", "yt-dlp could not be started.", "Supply --yt-dlp PATH to a compatible local helper."))?;
-    if !output.status.success() {
+    if !status.success() {
         return Err(ProbeError::new("yt_dlp_failed", "yt-dlp could not resolve the video.", "Update the helper or open the video in a browser."));
     }
-    let json = std::str::from_utf8(&output.stdout).map_err(|_| ProbeError::new(
+    let parse_start = Instant::now();
+    let json = std::str::from_utf8(&stdout).map_err(|_| ProbeError::new(
         "malformed_response", "yt-dlp returned non-UTF8 output.", "Update yt-dlp and retry."
     ))?;
-    parse_provider_json(Provider::YtDlp, id, json)
+    let result = parse_provider_json(Provider::YtDlp, id, json);
+    if let Some(id) = trace { trace_event("extract_parse_done", format_args!("id={id} elapsed_us={} bytes={} success={}", parse_start.elapsed().as_micros(), stdout.len(), result.is_ok())); }
+    result
 }
 
 /// Full capability extraction used by the public harness. Never silently
@@ -404,15 +488,26 @@ pub async fn extract_playback_with_ejs(
     lean_metadata: bool,
     native_ejs: Option<&Path>,
 ) -> Result<ExtractionResult, ProbeError> {
+    extract_playback_traced(url, selected, helper, lean_metadata, native_ejs, None).await
+}
+
+pub async fn extract_playback_traced(
+    url: &str, selected: Provider, helper: &Path, lean_metadata: bool,
+    native_ejs: Option<&Path>, trace: Option<u64>,
+) -> Result<ExtractionResult, ProbeError> {
     let (id, canonical) = canonical_video_url(url)?;
-    match selected {
+    if let Some(trace_id) = trace { trace_event("extract_begin", format_args!("id={trace_id} video={id} provider={selected:?} native_ejs={}", native_ejs.is_some())); }
+    let started = Instant::now();
+    let result = match selected {
         Provider::Rust => rust_extract(&canonical, &id).await,
-        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs).await,
+        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace).await,
         Provider::Auto => match rust_extract(&canonical, &id).await {
             Ok(result) if matches!(&result.streams, Capability::Available(_)) => Ok(result),
-            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs).await,
+            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace).await,
         },
-    }
+    };
+    if let Some(id) = trace { trace_event("extract_end", format_args!("id={id} elapsed_ms={} success={}", started.elapsed().as_millis(), result.is_ok())); }
+    result
 }
 
 /// Search initially loads eight results. Each additional request retrieves
