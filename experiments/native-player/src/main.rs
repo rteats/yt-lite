@@ -5,6 +5,7 @@
 mod mpv;
 
 use mpv::{PlaybackEvent, Player};
+use yt_lite_extraction_proof::persistent::PersistentWorker;
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
 use yt_lite_extraction_proof::{canonical_video_url, extract_playback_attempt, trace_event, trace_id, search_youtube_with_limit, validated_search_query, HttpPlaybackHeaders, Provider, SearchHit, SearchPage, SEARCH_BATCH_SIZE, SEARCH_MAX_RESULTS};
@@ -314,6 +315,7 @@ struct ResolvedStream {
     selected_height: Option<u64>,
     used_native_ejs: bool,
     used_fast_extraction: bool,
+    used_persistent: bool,
     trace: Option<u64>,
     video_format: String,
     audio_format: Option<String>,
@@ -328,7 +330,10 @@ type StreamResolution = Result<ResolvedStream, String>;
 /// Fetch metadata off the UI thread, preferring a muxed stream. If the
 /// video only offers separate A/V formats, keep both URLs inside this worker
 /// response for libmpv to stream independently. No video is downloaded.
-fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool, native_ejs: Option<PathBuf>, profile_timings: bool, fast_extraction: bool) -> Receiver<StreamResolution> {
+fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean_metadata: bool, native_ejs: Option<PathBuf>, profile_timings: bool, fast_extraction: bool, persistent: Option<&PersistentWorker>) -> Receiver<StreamResolution> {
+    // Submit on the caller thread to preserve the actual selection order.
+    let ticket = persistent.filter(|_| provider == Provider::YtDlp)
+        .map(|worker| worker.submit(&video_url));
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let extraction_started = Instant::now();
@@ -339,16 +344,24 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 .map_err(|_| "Could not initialize network extraction runtime".to_string())?;
             runtime.block_on(async {
                 let mut used_native_ejs = provider == Provider::YtDlp && native_ejs.is_some();
-                let mut used_fast_extraction = provider == Provider::YtDlp && fast_extraction;
+                let mut used_persistent = ticket.is_some();
+                let mut used_fast_extraction = provider == Provider::YtDlp && (fast_extraction || used_persistent);
                 let solver = if used_native_ejs { native_ejs.as_deref() } else { None };
-                let mut trace = profile_timings.then(trace_id);
-                let mut attempt = extract_playback_attempt(&video_url, provider, &helper, lean_metadata, solver, trace, used_fast_extraction).await;
+                let mut trace = if profile_timings { Some(ticket.as_ref().map(|t| t.id()).unwrap_or_else(trace_id)) } else { None };
+                let mut attempt = if let Some(t) = ticket.as_ref() {
+                    let result = t.resolve();
+                    if !t.is_current() { return Err("Extraction superseded".into()); }
+                    result
+                } else {
+                    extract_playback_attempt(&video_url, provider, &helper, lean_metadata, solver, trace, used_fast_extraction).await
+                };
                 // A zero exit code is not sufficient: a solver failure may
                 // leave only unusable formats in the returned metadata.
                 if (used_native_ejs || used_fast_extraction) && !attempt.as_ref().ok().is_some_and(|info| select_playback_streams(info).is_some()) {
                     eprintln!("[yt-lite] experimental extraction failed or returned no playable pair; retrying standard yt-dlp");
                     used_native_ejs = false;
                     used_fast_extraction = false;
+                    used_persistent = false;
                     trace = profile_timings.then(trace_id);
                     attempt = extract_playback_attempt(&video_url, provider, &helper, lean_metadata, None, trace, false).await;
                 }
@@ -380,6 +393,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                     selected_height,
                     used_native_ejs,
                     used_fast_extraction,
+                    used_persistent,
                     trace,
                     video_format,
                     audio_format,
@@ -496,12 +510,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut profile_timings = false;
     let mut lean_metadata = false;
     let mut fast_extraction = false;
+    let mut persistent_extraction = false;
+    let mut worker_python = PathBuf::from("python");
+    let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
     let mut native_ejs: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--timings" => profile_timings = true,
             "--lean-metadata" => lean_metadata = true,
             "--fast-extraction" => fast_extraction = true,
+            "--persistent-extraction" => persistent_extraction = true,
+            "--worker-python" => worker_python = PathBuf::from(args.next().ok_or("Missing --worker-python PATH")?),
+            "--worker-script" => worker_script = PathBuf::from(args.next().ok_or("Missing --worker-script PATH")?),
             "--native-ejs" => {
                 let path = PathBuf::from(args.next().ok_or("Missing --native-ejs PATH")?);
                 let path = path.canonicalize().map_err(|_| "Native EJS executable does not exist")?;
@@ -520,6 +540,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ if source.is_none() => source = Some(arg),
             _ => return Err("Only one media source may be supplied".into()),
         }
+    }
+    if persistent_extraction && (fast_extraction || native_ejs.is_some() || lean_metadata || requested_provider == Provider::Rust) {
+        return Err("Benchmark --persistent-extraction alone with auto or yt-dlp provider".into());
     }
     if fast_extraction && native_ejs.is_some() {
         return Err("Benchmark --fast-extraction and --native-ejs separately".into());
@@ -548,7 +571,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(path), None)
     };
     let initial_provider = preferred_playback_provider(requested_provider);
-    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata, native_ejs.clone(), profile_timings, fast_extraction));
+    let persistent = if persistent_extraction {
+        eprintln!("[yt-lite] experimental persistent extraction enabled (standard fallback retained)");
+        Some(PersistentWorker::start(worker_python, worker_script, profile_timings))
+    } else { None };
+    let remote_receiver = remote_url.clone().map(|url| spawn_extraction(url, helper.clone(), initial_provider, lean_metadata, native_ejs.clone(), profile_timings, fast_extraction, persistent.as_ref()));
     // mpv's OpenGL proc resolver uses WGL; do not silently choose Direct3D or software.
     slint::BackendSelector::new().backend_name("winit".into())
         .renderer_name("femtovg".into()).require_opengl().select()?;
@@ -921,7 +948,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // even if the previous video was left paused.
                     let _ = label_player.borrow().send_strings(&["set".into(), "pause".into(), "no".into()]);
                     active_provider = preferred_playback_provider(requested_provider);
-                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata, native_ejs.clone(), profile_timings, fast_extraction));
+                    receiver = Some(spawn_extraction(canonical.clone(), helper.clone(), active_provider, lean_metadata, native_ejs.clone(), profile_timings, fast_extraction, persistent.as_ref()));
                     pending = None;
                     resolving = true;
                     remote_url = Some(canonical.clone());
@@ -1109,7 +1136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 stream.audio_format.as_deref().map(safe).unwrap_or_else(|| "muxed".into()));
                         }
                         if profile_timings {
-                            let label = if used_fast_extraction { "yt-dlp-fast" } else if used_native_ejs { "yt-dlp-native-ejs-requested" } else { provider_label(stream.provider) };
+                            let label = if stream.used_persistent { "yt-dlp-persistent" } else if used_fast_extraction { "yt-dlp-fast" } else if used_native_ejs { "yt-dlp-native-ejs-requested" } else { provider_label(stream.provider) };
                             eprintln!("[yt-lite] timing {}-extract={}ms", label, stream.extraction_ms);
                         }
                         media_title = Some(stream.watch.title.clone());
@@ -1203,7 +1230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let url = remote_url.as_ref().unwrap().clone();
                 eprintln!("[yt-lite] experimental media failed; retrying standard yt-dlp");
                 let _ = label_player.borrow().send_strings(&["stop".into()]);
-                receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, lean_metadata, None, profile_timings, false));
+                receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, lean_metadata, None, profile_timings, false, None));
                 pending = None;
                 resolving = true;
                 load_started = None;
@@ -1221,7 +1248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref url) = remote_url {
                     eprintln!("[yt-lite] {} failed: {err}; retrying via {}", provider_label(active_provider), provider_label(next));
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
-                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata, None, profile_timings, false));
+                    receiver = Some(spawn_extraction(url.clone(), helper.clone(), next, lean_metadata, None, profile_timings, false, None));
                     active_provider = next;
                     pending = None;
                     resolving = true;

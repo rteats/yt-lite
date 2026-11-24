@@ -31,3 +31,16 @@ Replace VERSION with the exact version; if unavailable, document the version dif
 ## Known limitations
 
 A 2.5-second timeout was successful in three runs but never actually triggered a timeout. Skipping the webpage failed in all three attempts and is not implemented. HLS omission was validated for one video only. Connection resets remain unexplained. Audio startup, seeks and UI timer gaps are separate work.
+
+
+## Persistent native-player integration
+
+The opt-in `--persistent-extraction` mode starts a Python worker asynchronously and uses the same fast arguments as the benchmark. It is independent of the standalone `--fast-extraction` and `--native-ejs` modes. Supply the Python interpreter from the benchmark environment explicitly. The script defaults to `experiments/extraction-latency/worker.py` relative to the current working directory; use `--worker-script PATH` when launching elsewhere.
+
+```powershell
+$python = (Resolve-Path ".\.venv-extraction-bench\Scripts\python.exe").Path
+$worker = (Resolve-Path ".\experiments\extraction-latency\worker.py").Path
+& $player --provider auto --yt-dlp $helper --timings --persistent-extraction --worker-python $python --worker-script $worker
+```
+
+Switch between videos in the same window. Compare `persistent_ready`, `persistent_begin`, `persistent_reply`, `persistent_recovery`, `yt-dlp-persistent-extract`, `load_requested` and `audio_pts_first_observed` timings. `wire_ms` includes extraction and serialization; compare with `extract_ms` and `serialize_ms`, rather than treating it as pure IPC. The provisional request budget is 12 seconds, including queue time. A stale in-flight request, timeout, broken pipe or invalid response causes the supervisor to discard that process. A failed or unusable extraction, or media failure through the existing playback recovery path, retries standard yt-dlp once. Python is not bundled yet. Killing the Python process does not guarantee termination of all descendants on Windows; packaging and process-tree supervision remain follow-up work. Run the offline protocol test with `python -m unittest discover -s experiments/extraction-latency -p test_worker.py`.

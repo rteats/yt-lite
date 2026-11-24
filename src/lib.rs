@@ -1,6 +1,8 @@
 //! Feasibility harness for the yt-lite extraction adapter seam (issue #3).
 //! No stream URLs, cookies or provider stderr are included in error messages.
 
+pub mod persistent;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::Path, time::Duration};
