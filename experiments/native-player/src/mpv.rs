@@ -10,6 +10,7 @@ use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
 use std::{
+    cell::Cell,
     ffi::{c_char, c_int, c_void, CStr, CString},
     path::Path,
     ptr,
@@ -103,8 +104,7 @@ const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
-const LOADFILE_REPLY_ID: u64 = 0x594c_4f41_44;
-const EXTERNAL_AUDIO_REPLY_ID: u64 = 0x5941_5544_494f;
+const LOADFILE_REPLY_ID: u64 = 1;
 
 #[derive(Clone, Copy)]
 struct Api {
@@ -199,6 +199,8 @@ pub struct Player {
     context: *mut c_void,
     wake: Option<Box<Wake>>,
     loaded: bool,
+    next_audio_reply: Cell<u64>,
+    pending_audio_reply: Cell<Option<u64>>,
     last_video_margins: Option<(u64, u64, u64)>,
     _lib: Library,
 }
@@ -222,7 +224,17 @@ impl Player {
         let api = unsafe { Api::load(&lib)? };
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
-        let player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, last_video_margins: None, _lib: lib };
+        let player = Self {
+            api,
+            handle,
+            context: ptr::null_mut(),
+            wake: None,
+            loaded: false,
+            next_audio_reply: Cell::new(LOADFILE_REPLY_ID + 1),
+            pending_audio_reply: Cell::new(None),
+            last_video_margins: None,
+            _lib: lib,
+        };
         // Network HTTP media is streamed through libmpv with bounded memory,
         // no disk cache, and no full-file download before playback.
         for (key, value) in [
@@ -312,10 +324,11 @@ impl Player {
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return Err("Extractor returned a non-HTTP audio stream".into());
         }
-        self.send_command(
-            &["audio-add".into(), url.into(), "select".into()],
-            EXTERNAL_AUDIO_REPLY_ID,
-        )
+        let reply = self.next_audio_reply.get();
+        self.send_command(&["audio-add".into(), url.into(), "select".into()], reply)?;
+        self.next_audio_reply.set(reply + 1);
+        self.pending_audio_reply.set(Some(reply));
+        Ok(())
     }
 
     /// mpv renders to the full GL framebuffer; reserve Slint chrome as
@@ -352,7 +365,14 @@ impl Player {
         let mut pointers: Vec<*const c_char> = strings.iter().map(|s| s.as_ptr()).collect();
         pointers.push(ptr::null());
         let status = unsafe { (self.api.command_async)(self.handle, reply, pointers.as_ptr()) };
-        if status < 0 { Err(format!("mpv_command_async rejected command: {status}")) } else { Ok(()) }
+        if status < 0 {
+            return Err(format!("mpv_command_async rejected command: {status}"));
+        }
+        // An audio-add reply can arrive after the playing file is replaced.
+        if matches!(args.first().map(String::as_str), Some("stop" | "loadfile")) {
+            self.pending_audio_reply.set(None);
+        }
+        Ok(())
     }
 
     /// Nonblocking mpv event processing. Never include event payload filenames
@@ -381,7 +401,8 @@ impl Player {
                 MPV_EVENT_COMMAND_REPLY if event.reply_userdata == LOADFILE_REPLY_ID && event.error < 0 => {
                     events.push(PlaybackEvent::LoadFailed(event.error));
                 }
-                MPV_EVENT_COMMAND_REPLY if event.reply_userdata == EXTERNAL_AUDIO_REPLY_ID => {
+                MPV_EVENT_COMMAND_REPLY if self.pending_audio_reply.get() == Some(event.reply_userdata) => {
+                    self.pending_audio_reply.set(None);
                     if event.error < 0 {
                         events.push(PlaybackEvent::ExternalAudioFailed(event.error));
                     } else {
@@ -454,5 +475,32 @@ impl Drop for Player {
             self.teardown_render();
         }
         unsafe { (self.api.terminate_destroy)(self.handle) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlaybackEvent, Player};
+    use std::{thread, time::{Duration, Instant}};
+
+    #[test]
+    #[ignore = "requires mpv-2.dll or libmpv-2.dll alongside the test executable"]
+    fn stopping_playback_discards_only_the_superseded_audio_reply() {
+        let player = Player::open().unwrap();
+        // With no file loaded, each audio command produces a failure reply.
+        let url = "http://127.0.0.1:1/unused";
+        player.add_external_audio(url).unwrap();
+        player.send_strings(&["stop".into()]).unwrap();
+        player.add_external_audio(url).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut failures = 0;
+        while Instant::now() < deadline {
+            failures += player.poll_events().into_iter()
+                .filter(|event| matches!(event, PlaybackEvent::ExternalAudioFailed(_)))
+                .count();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(failures, 1, "only the current audio command can fail playback");
     }
 }
