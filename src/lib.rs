@@ -21,7 +21,7 @@ pub fn trace_id() -> u64 { TRACE_NEXT.fetch_add(1, Ordering::Relaxed) }
 /// Return only fixed categories, never any part of a provider log line.
 pub fn extraction_marker(line: &str) -> Option<&'static str> {
     let s = line.to_ascii_lowercase();
-    if s.contains("retrying") || s.contains("retrying (") { return Some("retry"); }
+    if s.contains("retrying") { return Some("retry"); }
     if s.contains("timed out") || s.contains("timeout") && s.starts_with("warning:") { return Some("timeout_warning"); }
     if s.starts_with("warning:") { return Some("warning"); }
     if s.starts_with("error:") { return Some("error"); }
@@ -43,7 +43,7 @@ pub fn extraction_marker(line: &str) -> Option<&'static str> {
 
 async fn traced_helper(cmd: &mut Command, id: u64) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
     let started = Instant::now();
-     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     trace_event("extract_spawned", format_args!("id={id} elapsed_ms={}", started.elapsed().as_millis()));
     let mut stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -427,8 +427,9 @@ async fn yt_dlp_extract(
 ) -> Result<ExtractionResult, ProbeError> {
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true)
-        .args(["--ignore-config", "--no-playlist", "--no-warnings", "--skip-download"])
+        .args(["--ignore-config", "--no-playlist", "--skip-download"])
         .args(yt_dlp_output_args(lean_metadata));
+    if trace.is_none() { cmd.arg("--no-warnings"); }
     if let Some(solver) = native_ejs {
         // Use the upstream EJS compatibility executable as the only enabled
         // JS runtime for this attempt. No shell, auto-install or plugin loading.

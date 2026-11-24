@@ -746,6 +746,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_trace: Option<u64> = None;
     let mut audio_started: Option<Instant> = None;
     let mut first_audio = false;
+    let mut awaiting_seek_audio: Option<(u64, Instant)> = None;
     let mut previous_wait_state = None;
     let mut last_tick = Instant::now();
     let clock = Timer::default();
@@ -929,6 +930,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     active_trace = None;
                     audio_started = None;
                     first_audio = false;
+                    awaiting_seek_audio = None;
                     previous_wait_state = None;
                     if let Some(ui) = label_window.upgrade() {
                         ui.set_has_url(true);
@@ -963,7 +965,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PlaybackEvent::PlaybackRestart => {
                     if profile_timings {
                         if let Some((id, start)) = pending_seek_timing.borrow_mut().take() {
-                            trace_event("seek_restart_observed", format_args!("id={id} elapsed_ms={}", start.elapsed().as_millis()));
+                            let audio_pts = label_player.borrow().property_double(c"audio-pts");
+                            trace_event("seek_restart_observed", format_args!("id={id} elapsed_ms={} audio_pts={audio_pts:?}", start.elapsed().as_millis()));
+                            awaiting_seek_audio = Some((id, start));
                             eprintln!("[yt-lite] timing seek-to-playback-restart={}ms", start.elapsed().as_millis());
                         }
                     }
@@ -1071,6 +1075,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         active_trace = stream.trace;
                         audio_started = None;
                         first_audio = false;
+                        awaiting_seek_audio = None;
                         previous_wait_state = None;
                         active_provider = stream.provider;
                         used_native_ejs = stream.used_native_ejs;
@@ -1137,6 +1142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             audio_warning = false;
             audio_started = None;
             first_audio = false;
+            awaiting_seek_audio = None;
             previous_wait_state = None;
             if profile_timings { trace_event("playback_failure", format_args!("load={active_trace:?}")); }
             if let Some((url, headers)) = fallback_muxed.take() {
@@ -1246,8 +1252,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let audio_pts = player.property_double(c"audio-pts");
             let state = (seeking, buffering, paused, audio_pts.is_some());
             let changed = previous_wait_state != Some(state);
+            if pending_seek_timing.borrow().is_some() { awaiting_seek_audio = None; }
+            if let Some((id, start)) = awaiting_seek_audio {
+                if audio_pts.is_some() && seeking == Some(false) {
+                    trace_event("seek_audio_pts_observed", format_args!("id={id} elapsed_ms={} pts={audio_pts:?}", start.elapsed().as_millis()));
+                    awaiting_seek_audio = None;
+                } else if start.elapsed() > Duration::from_secs(30) {
+                    trace_event("seek_audio_pts_unavailable", format_args!("id={id} elapsed_ms={}", start.elapsed().as_millis()));
+                    awaiting_seek_audio = None;
+                }
+            }
             let waiting = load_started.is_some() || pending_seek_timing.borrow().is_some()
-                || seeking == Some(true) || buffering == Some(true) || !first_audio;
+                || awaiting_seek_audio.is_some() || seeking == Some(true) || buffering == Some(true) || !first_audio;
             if !first_audio && audio_pts.is_some() && file_loaded {
                 first_audio = true;
                 trace_event("audio_pts_first_observed", format_args!("load={active_trace:?} since_add_ms={:?} pts={audio_pts:?}", audio_started.map(|t| t.elapsed().as_millis())));
