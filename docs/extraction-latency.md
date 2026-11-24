@@ -26,7 +26,7 @@ py -m venv .venv-extraction-bench
 .\.venv-extraction-bench\Scripts\python.exe experiments/extraction-latency/benchmark.py --runs 5 $url
 ```
 
-Replace VERSION with the exact version; if unavailable, document the version difference. Add other public watch URLs as positional arguments to avoid testing only one player script/video. The warm worker's first extraction is cold in terms of connections/solver state; inspect it separately. Cold timings include process startup/import/exit; warm timings exclude shared initialization (reported separately). The results are sanitized summaries, not playback verification. No speedup or connection/solver reuse is assumed.
+Replace VERSION with the exact version; if unavailable, document the version difference. Add other public watch URLs as positional arguments to avoid testing only one player script/video. The warm worker's first extraction is cold in terms of connections/solver state; inspect it separately. Cold timings include process startup/import/exit; warm timings exclude shared initialization (reported separately). The summary counts direct audio and video candidates, not compatible pairs or verified playback; the warm call is not subject to the cold subprocess’s 60-second outer deadline. The results are sanitized summaries, not playback verification. No speedup or connection/solver reuse is assumed.
 
 ## Known limitations
 

@@ -50,7 +50,10 @@ def summarize(info, logger, elapsed, ok):
               if f.get("url") and f.get("protocol") in ("http", "https")]
     def has_format(n):
         return any(str(f.get("format_id", "")).split("-")[0] == n for f in direct)
+    has_video = any(f.get("vcodec") not in (None, "none") for f in direct)
+    has_audio = any(f.get("acodec") not in (None, "none") for f in direct)
     return dict(ms=round(elapsed * 1000), ok=ok, direct=len(direct),
+                direct_av=has_video and has_audio,
                 format399=has_format("399"), format251=has_format("251"),
                 retries=logger.retries, resets=logger.resets, timeouts=logger.timeouts,
                 solver_failures=logger.solver_failures)
@@ -112,15 +115,20 @@ def main():
                             [sys.executable, __file__, "--child", url],
                             capture_output=True, text=True, timeout=60, check=True)
                         result = json.loads(proc.stdout)
-                    except (subprocess.SubprocessError, ValueError):
-                        result = summarize(None, logger, 0, False)
+                    except (subprocess.SubprocessError, ValueError) as exc:
+                        # Do not reuse counters from the preceding warm sample.
+                        cold_logger = SafeLogger()
+                        cold_logger.timeouts = int(isinstance(exc, subprocess.TimeoutExpired))
+                        result = summarize(None, cold_logger, 0, False)
                     result["ms"] = round((time.perf_counter() - started) * 1000)
                 samples[mode].append(result)
                 print(json.dumps(dict(run=i + 1, mode=mode, **result)), flush=True)
     for mode, rows in samples.items():
-        good = [r["ms"] for r in rows if r["ok"] and r["direct"]]
-        print(json.dumps(dict(mode=mode, usable=len(good), total=len(rows),
+        good = [r["ms"] for r in rows if r["ok"] and r["direct_av"]]
+        steady = [r["ms"] for r in rows[1:] if r["ok"] and r["direct_av"]]
+        print(json.dumps(dict(mode=mode, direct_av_candidates=len(good), total=len(rows),
                               median_ms=statistics.median(good) if good else None,
+                              median_after_first_ms=statistics.median(steady) if steady else None,
                               max_ms=max(good) if good else None)), flush=True)
 
 
