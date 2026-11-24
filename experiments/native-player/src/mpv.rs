@@ -5,7 +5,7 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
-use yt_lite_native_player_proof::{search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
+use yt_lite_native_player_proof::{preattached_audio_command, search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
 use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
@@ -104,7 +104,7 @@ const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
-const LOADFILE_REPLY_ID: u64 = 1;
+const FIRST_REPLY_ID: u64 = 1;
 
 #[derive(Clone, Copy)]
 struct Api {
@@ -199,7 +199,8 @@ pub struct Player {
     context: *mut c_void,
     wake: Option<Box<Wake>>,
     loaded: bool,
-    next_audio_reply: Cell<u64>,
+    next_reply: Cell<u64>,
+    pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
     last_video_margins: Option<(u64, u64, u64)>,
     _lib: Library,
@@ -230,7 +231,8 @@ impl Player {
             context: ptr::null_mut(),
             wake: None,
             loaded: false,
-            next_audio_reply: Cell::new(LOADFILE_REPLY_ID + 1),
+            next_reply: Cell::new(FIRST_REPLY_ID),
+            pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
             last_video_margins: None,
             _lib: lib,
@@ -288,6 +290,16 @@ impl Player {
         url: &str,
         headers: &HttpPlaybackHeaders,
     ) -> Result<(), String> {
+        self.load_network_media(url, None, headers)
+    }
+
+    /// Experimental: ask mpv to attach the audio during the initial load.
+    /// Per-file options are restored by mpv when the file is replaced.
+    pub fn load_network_with_audio(&mut self, url: &str, audio: &str, headers: &HttpPlaybackHeaders) -> Result<(), String> {
+        self.load_network_media(url, Some(audio), headers)
+    }
+
+    fn load_network_media(&mut self, url: &str, audio: Option<&str>, headers: &HttpPlaybackHeaders) -> Result<(), String> {
         if !self.is_render_ready() {
             return Err("libmpv render context is not ready yet".into());
         }
@@ -302,7 +314,12 @@ impl Player {
         if let Some(ref referer) = headers.referer {
             self.set_string_property(c"referrer", referer)?;
         }
-        self.send_loadfile(url)?;
+        if let Some(audio) = audio {
+            let args = preattached_audio_command(url, audio).ok_or("Invalid split HTTP media URL")?;
+            self.send_load_command(&args)?;
+        } else {
+            self.send_loadfile(url)?;
+        }
         self.loaded = true;
         Ok(())
     }
@@ -324,9 +341,8 @@ impl Player {
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return Err("Extractor returned a non-HTTP audio stream".into());
         }
-        let reply = self.next_audio_reply.get();
+        let reply = self.allocate_reply();
         self.send_command(&["audio-add".into(), url.into(), "select".into()], reply)?;
-        self.next_audio_reply.set(reply + 1);
         self.pending_audio_reply.set(Some(reply));
         Ok(())
     }
@@ -356,7 +372,20 @@ impl Player {
     }
 
     fn send_loadfile(&self, target: &str) -> Result<(), String> {
-        self.send_command(&["loadfile".into(), target.into(), "replace".into()], LOADFILE_REPLY_ID)
+        self.send_load_command(&["loadfile".into(), target.into(), "replace".into()])
+    }
+
+    fn allocate_reply(&self) -> u64 {
+        let id = self.next_reply.get();
+        self.next_reply.set(id.wrapping_add(1).max(FIRST_REPLY_ID));
+        id
+    }
+
+    fn send_load_command(&self, args: &[String]) -> Result<(), String> {
+        let reply = self.allocate_reply();
+        self.send_command(args, reply)?;
+        self.pending_load_reply.set(Some(reply));
+        Ok(())
     }
 
     fn send_command(&self, args: &[String], reply: u64) -> Result<(), String> {
@@ -371,6 +400,7 @@ impl Player {
         // An audio-add reply can arrive after the playing file is replaced.
         if matches!(args.first().map(String::as_str), Some("stop" | "loadfile")) {
             self.pending_audio_reply.set(None);
+            self.pending_load_reply.set(None);
         }
         Ok(())
     }
@@ -398,8 +428,9 @@ impl Player {
                 MPV_EVENT_START_FILE => events.push(PlaybackEvent::StartFile),
                 MPV_EVENT_FILE_LOADED => events.push(PlaybackEvent::FileLoaded),
                 MPV_EVENT_PLAYBACK_RESTART => events.push(PlaybackEvent::PlaybackRestart),
-                MPV_EVENT_COMMAND_REPLY if event.reply_userdata == LOADFILE_REPLY_ID && event.error < 0 => {
-                    events.push(PlaybackEvent::LoadFailed(event.error));
+                MPV_EVENT_COMMAND_REPLY if self.pending_load_reply.get() == Some(event.reply_userdata) => {
+                    self.pending_load_reply.set(None);
+                    if event.error < 0 { events.push(PlaybackEvent::LoadFailed(event.error)); }
                 }
                 MPV_EVENT_COMMAND_REPLY if self.pending_audio_reply.get() == Some(event.reply_userdata) => {
                     self.pending_audio_reply.set(None);

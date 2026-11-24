@@ -510,6 +510,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut profile_timings = false;
     let mut lean_metadata = false;
     let mut fast_extraction = false;
+    let mut preattach_audio = false;
     let mut persistent_extraction = false;
     let mut worker_python = PathBuf::from("python");
     let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
@@ -519,6 +520,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--timings" => profile_timings = true,
             "--lean-metadata" => lean_metadata = true,
             "--fast-extraction" => fast_extraction = true,
+            "--preattach-audio" => preattach_audio = true,
             "--persistent-extraction" => persistent_extraction = true,
             "--worker-python" => worker_python = PathBuf::from(args.next().ok_or("Missing --worker-python PATH")?),
             "--worker-script" => worker_script = PathBuf::from(args.next().ok_or("Missing --worker-script PATH")?),
@@ -547,6 +549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fast_extraction && native_ejs.is_some() {
         return Err("Benchmark --fast-extraction and --native-ejs separately".into());
     }
+    if preattach_audio { eprintln!("[yt-lite] experimental preattached audio enabled (serial fallback retained)"); }
     if fast_extraction {
         eprintln!("[yt-lite] experimental fast extraction enabled (standard fallback retained)");
     }
@@ -776,6 +779,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_advanced = false;
     let mut has_network_media = false;
     let mut pending_external_audio: Option<String> = None;
+    // Retain only the current split pair until the first audio clock is observed.
+    let mut preattach_retry: Option<(String, String, HttpPlaybackHeaders)> = None;
+    let mut media_load_dispatched: Option<Instant> = None;
     let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let mut used_native_ejs = false;
     let mut used_fast_extraction = false;
@@ -963,6 +969,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     playback_advanced = false;
                     has_network_media = false;
                     pending_external_audio = None;
+                    preattach_retry = None;
+                    media_load_dispatched = None;
                     fallback_muxed = None;
                     used_native_ejs = false;
                     used_fast_extraction = false;
@@ -1069,6 +1077,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let position = label_player.borrow().property_double(c"time-pos").unwrap_or(0.0);
             if position > 0.1 { playback_advanced = true; }
             let manually_paused = label_player.borrow().property_flag(c"pause").unwrap_or(false);
+            if preattach_retry.is_some() {
+                if label_player.borrow().property_double(c"audio-pts").is_some() {
+                    preattach_retry = None;
+                    if profile_timings { trace_event("preattached_audio_ready", format_args!("load={active_trace:?} since_load_ms={:?}", media_load_dispatched.map(|t| t.elapsed().as_millis()))); }
+                } else if !manually_paused && start.elapsed() > Duration::from_secs(5) {
+                    failure.get_or_insert_with(|| "Preattached audio clock did not become available".into());
+                }
+            }
             if !playback_advanced && !manually_paused && start.elapsed() > Duration::from_secs(20) {
                 failure.get_or_insert_with(|| "No decoded playback progress within 20 seconds".into());
             }
@@ -1157,11 +1173,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("[yt-lite] selected {height}p {mode} for automatic quality");
                         }
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
-                        if profile_timings { trace_event("load_requested", format_args!("load={active_trace:?}")); }
-                        match label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers) {
+                        fallback_muxed = stream.fallback_muxed;
+                        preattach_retry = None;
+                        media_load_dispatched = Some(Instant::now());
+                        if preattach_audio {
+                            if let Some(audio) = stream.audio_url.as_ref() {
+                                preattach_retry = Some((stream.url.clone(), audio.clone(), stream.headers.clone()));
+                                audio_started = media_load_dispatched;
+                            }
+                        }
+                        let preattached = preattach_retry.is_some();
+                        if profile_timings { trace_event("load_requested", format_args!("load={active_trace:?} preattached={preattached}")); }
+                        let result = if let Some((video, audio, headers)) = preattach_retry.as_ref() {
+                            label_player.borrow_mut().load_network_with_audio(video, audio, headers)
+                        } else {
+                            label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers)
+                        };
+                        match result {
                             Ok(()) => {
-                                fallback_muxed = stream.fallback_muxed;
-                                pending_external_audio = stream.audio_url;
+                                pending_external_audio = if preattached { None } else { stream.audio_url };
                                 load_started = Some(Instant::now());
                                 file_loaded = false;
                                 file_loaded_at = None;
@@ -1187,11 +1217,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             awaiting_seek_audio = None;
             previous_wait_state = None;
             if profile_timings { trace_event("playback_failure", format_args!("load={active_trace:?}")); }
-            if let Some((url, headers)) = fallback_muxed.take() {
+            if let Some((video, audio, headers)) = preattach_retry.take() {
+                eprintln!("[yt-lite] preattached audio startup failed; retrying the same split streams serially");
+                if profile_timings { trace_event("preattached_audio_fallback", format_args!("load={active_trace:?} since_load_ms={:?}", media_load_dispatched.map(|t| t.elapsed().as_millis()))); }
+                let _ = label_player.borrow().send_strings(&["stop".into()]);
+                media_load_dispatched = Some(Instant::now());
+                if profile_timings { trace_event("load_requested", format_args!("load={active_trace:?} preattached=false retry=true")); }
+                let result = label_player.borrow_mut().load_network_stream(&video, &headers);
+                load_started = None;
+                file_loaded = false;
+                file_loaded_at = None;
+                playback_advanced = false;
+                has_network_media = false;
+                pending_external_audio = None;
+                if let Some(ui) = label_window.upgrade() { ui.set_has_media(false); }
+                match result {
+                    Ok(()) => {
+                        load_started = media_load_dispatched;
+                        pending_external_audio = Some(audio);
+                        has_network_media = true;
+                        playback_error = None;
+                    }
+                    Err(error) => {
+                        pending = Some(Err(error));
+                        resolving = true;
+                    }
+                }
+            } else if let Some((url, headers)) = fallback_muxed.take() {
                 eprintln!("[yt-lite] high-quality stream failed: {err}; retrying compatible combined A/V");
                 pending_external_audio = None;
                 let _ = label_player.borrow().send_strings(&["stop".into()]);
                 if profile_timings { trace_event("muxed_fallback_requested", format_args!("load={active_trace:?}")); }
+                media_load_dispatched = Some(Instant::now());
                 match label_player.borrow_mut().load_network_stream(&url, &headers) {
                     Ok(()) => {
                         load_started = Some(Instant::now());
@@ -1239,6 +1296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 playback_advanced = false;
                 has_network_media = false;
                 pending_external_audio = None;
+                preattach_retry = None;
+                media_load_dispatched = None;
                 fallback_muxed = None;
                 if let Some(ui) = label_window.upgrade() {
                     ui.set_has_media(false);
@@ -1260,6 +1319,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     playback_advanced = false;
                     has_network_media = false;
                     pending_external_audio = None;
+                    preattach_retry = None;
+                    media_load_dispatched = None;
                     fallback_muxed = None;
                     used_native_ejs = false;
                     used_fast_extraction = false;
@@ -1310,7 +1371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || awaiting_seek_audio.is_some() || seeking == Some(true) || buffering == Some(true) || !first_audio;
             if !first_audio && audio_pts.is_some() && file_loaded {
                 first_audio = true;
-                trace_event("audio_pts_first_observed", format_args!("load={active_trace:?} since_add_ms={:?} pts={audio_pts:?}", audio_started.map(|t| t.elapsed().as_millis())));
+                trace_event("audio_pts_first_observed", format_args!("load={active_trace:?} since_load_ms={:?} since_add_ms={:?} pts={audio_pts:?}", media_load_dispatched.map(|t| t.elapsed().as_millis()), audio_started.map(|t| t.elapsed().as_millis())));
             }
             if changed || waiting || (audio_warning && Instant::now() >= next_audio_log) {
                 trace_event("wait_state", format_args!("load={active_trace:?} seek={:?} pos={:?} audio_pts={audio_pts:?} seeking={seeking:?} buffering={buffering:?} paused={paused:?} cache_s={:?} cache_pct={:?} input_bytes_s={:?} avsync={:?}",

@@ -257,3 +257,15 @@ impl AudioContinuity {
         self.warning
     }
 }
+
+
+/// mpv >= 0.38 loadfile per-file options. The byte-counted quote keeps
+/// commas, percent escapes and other URL bytes out of the option grammar.
+/// The append action consumes exactly one path rather than a path list.
+pub fn preattached_audio_command(video: &str, audio: &str) -> Option<Vec<String>> {
+    let valid = |url: &str| (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.contains('\0');
+    if !valid(video) || !valid(audio) { return None; }
+    Some(vec!["loadfile".into(), video.into(), "replace".into(), "-1".into(),
+        format!("audio-files-append=%{}%{}", audio.len(), audio)])
+}

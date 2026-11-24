@@ -51,3 +51,10 @@ Offline Rust supervisor test (uses the fake worker, not YouTube):
 $env:YT_LITE_TEST_PYTHON = $python
 cargo test --test persistent_worker -- --ignored
 ```
+
+
+## Pre-attached audio startup experiment (issue #30)
+
+The existing split playback flow loads video, observes `FILE_LOADED` via the 250 ms UI timer, then sends `audio-add`. A captured run spent 500 ms until file-loaded, then 1,581 ms until the first audio PTS (2,081 ms total). The optional `--preattach-audio` mode supplies a per-file audio option in the initial libmpv loadfile command, using mpv >= 0.38's index and options arguments. See https://mpv.io/manual/stable/#command-interface-loadfile and https://mpv.io/manual/stable/#options-audio-files . It removes the application-level serial command dependency but does not guarantee that mpv demuxer requests overlap. No actual speedup is claimed. On startup errors or missing audio PTS five seconds after file-loaded (unless paused), retry the same split stream through the existing serial path before muxed/provider fallback. After audio PTS appears, ordinary audio continuity handling applies. Default, muxed playback, quality selection, cache limits and seeking are unchanged. The prior stale audio command-reply fix remains and loadfile command replies also have unique IDs; this does not fully correlate all mpv file lifecycle events.
+
+Build and compare alternating runs in separate sessions, holding extractor settings fixed. For example, append `--preattach-audio` to the existing persistent-mode command, then compare against that command without the flag. Record the same video IDs, selected format labels, `load_requested`, `libmpv-load`, `audio_pts_first_observed since_load_ms`, any `preattached_audio_fallback`, seek restart and audio-clock recovery. FILE_LOADED is not comparable between modes by itself; use time to first audio PTS and visually confirm initial audible audio, frame pacing and seek recovery. Also test rapid replacement and muxed-only media. No new media download or URL logging. The command-seam tests can run offline with `cargo test --manifest-path experiments/native-player/Cargo.toml --test preattached_audio`.
