@@ -34,6 +34,16 @@ function Get-SafeManifestType {
     return 'other'
 }
 
+# A command announcement is stronger than listing an available runtime,
+# but is still not proof of a successful solve. Deno's package-cache probe
+# can also start deno; count only launches after the solve announcement.
+function Get-ObservedSolver {
+    param([AllowEmptyString()][string] $Line)
+    if ($Line -match '(?i)\[jsc:quickjs\].*Running QuickJS:') { return 'native_ejs' }
+    if ($Line -match '(?i)\[jsc:deno\].*Running deno:') { return 'deno' }
+    return $null
+}
+
 if ($SelfTest) {
     $samples = @(
         @{ Text = '[youtube] SAMPLE12345: Downloading webpage'; Kind = 'webpage' },
@@ -53,6 +63,11 @@ if ($SelfTest) {
         (Get-SafeManifestType '[youtube] id: Downloading mpd manifest') -ne 'dash' -or
         (Get-SafeManifestType '[youtube] id: Downloading manifest') -ne 'other') {
         throw 'Manifest protocol classifier self-test failed.'
+    }
+    if ((Get-ObservedSolver '[debug] [youtube] [jsc:quickjs] Running QuickJS: ejs.exe --script temp.js') -ne 'native_ejs' -or
+        (Get-ObservedSolver '[debug] [youtube] [jsc:deno] Running deno: deno run -') -ne 'deno' -or
+        $null -ne (Get-ObservedSolver '[debug] [youtube] [jsc] JS Challenge Providers: deno, quickjs')) {
+        throw 'Solver launch classifier self-test failed.'
     }
     Write-Output 'profile-yt-dlp milestone self-test: passed'
     return
@@ -109,6 +124,7 @@ for ($round = 1; $round -le $Repetitions; $round++) {
 
     $milestones = @{}
     $solverObserved = $false
+    $denoSolveAnnounced = $false
     $jsSignals = 0
     $apiSignals = 0
     $manifestSignals = 0
@@ -145,10 +161,12 @@ for ($round = 1; $round -le $Repetitions; $round++) {
             }
             $line = $stderrTask.GetAwaiter().GetResult()
             if ($null -eq $line) { break }
-            if (($variant -eq 'native_ejs' -and $line -match '(?i)\[jsc:quickjs\].*Running QuickJS:') -or
-                ($variant -eq 'deno' -and $line -match '(?i)\[jsc:deno\].*Solving JS challenges using deno')) {
-                $solverObserved = $true
+            if ($line -match '(?i)\[jsc:deno\].*Solving JS challenges using deno') {
+                $denoSolveAnnounced = $true
             }
+            $observed = Get-ObservedSolver $line
+            if ($variant -eq 'native_ejs' -and $observed -eq 'native_ejs') { $solverObserved = $true }
+            if ($variant -eq 'deno' -and $observed -eq 'deno' -and $denoSolveAnnounced) { $solverObserved = $true }
             $kind = Get-SafeMilestone $line
             if ($kind) {
                 $elapsed = [int] $watch.ElapsedMilliseconds

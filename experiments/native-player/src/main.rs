@@ -1014,7 +1014,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         active_provider = stream.provider;
                         used_native_ejs = stream.used_native_ejs;
                         if profile_timings {
-                            let label = if used_native_ejs { "yt-dlp-native-ejs" } else { provider_label(stream.provider) };
+                            let label = if used_native_ejs { "yt-dlp-native-ejs-requested" } else { provider_label(stream.provider) };
                             eprintln!("[yt-lite] timing {}-extract={}ms", label, stream.extraction_ms);
                         }
                         media_title = Some(stream.watch.title.clone());
@@ -1071,12 +1071,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         playback_error = None;
                     }
                     Err(error) => {
-                        playback_error = Some(format!("Combined stream fallback failed: {error}"));
+                        let message = format!("Combined stream fallback failed: {error}");
                         load_started = None;
+                        file_loaded = false;
                         has_network_media = false;
+                        if used_native_ejs {
+                            // A synchronous load failure must also reach the
+                            // ordinary-runtime retry, not bypass it.
+                            pending = Some(Err(message));
+                            resolving = true;
+                        } else {
+                            playback_error = Some(message);
+                        }
                         if let Some(ui) = label_window.upgrade() {
                             ui.set_has_media(false);
-                            ui.set_can_retry(remote_url.is_some());
+                            ui.set_can_retry(!used_native_ejs && remote_url.is_some());
                         }
                     }
                 }
