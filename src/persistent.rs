@@ -15,6 +15,7 @@ const REQUEST_BUDGET: Duration = Duration::from_secs(12);
 const STARTUP_BUDGET: Duration = Duration::from_secs(8);
 const POLL: Duration = Duration::from_millis(40);
 const MAX_REPLY: u64 = 16 * 1024 * 1024;
+const SHUTDOWN: u64 = u64::MAX;
 
 type Reply = Result<ExtractionResult, ProbeError>;
 struct Request {
@@ -25,8 +26,9 @@ struct Request {
 }
 
 pub struct PersistentWorker {
-    requests: mpsc::Sender<Request>,
+    requests: Option<mpsc::Sender<Request>>,
     latest: Arc<AtomicU64>,
+    supervisor: Option<thread::JoinHandle<()>>,
 }
 
 pub struct Ticket {
@@ -57,27 +59,34 @@ impl PersistentWorker {
         let (requests, receiver) = mpsc::channel();
         let latest = Arc::new(AtomicU64::new(0));
         let generation = latest.clone();
-        thread::spawn(move || supervise(&python, &script, timings, receiver, generation));
-        Self { requests, latest }
+        let supervisor = thread::spawn(move || supervise(&python, &script, timings, receiver, generation));
+        Self { requests: Some(requests), latest, supervisor: Some(supervisor) }
     }
 
     pub fn submit(&self, url: &str) -> Ticket {
         let id = trace_id();
         self.latest.store(id, Ordering::Release);
         let (response, receiver) = mpsc::channel();
-        let _ = self.requests.send(Request { id, url: url.into(), started: Instant::now(), response });
+        if let Some(requests) = &self.requests {
+            let _ = requests.send(Request { id, url: url.into(), started: Instant::now(), response });
+        }
         Ticket { id, latest: self.latest.clone(), response: receiver }
     }
 }
 
 impl Drop for PersistentWorker {
-    fn drop(&mut self) { self.latest.store(0, Ordering::Release); }
+    fn drop(&mut self) {
+        self.latest.store(SHUTDOWN, Ordering::Release);
+        drop(self.requests.take());
+        if let Some(supervisor) = self.supervisor.take() { let _ = supervisor.join(); }
+    }
 }
 
 struct Process {
     child: Child,
     input: ChildStdin,
     output: mpsc::Receiver<Vec<u8>>,
+    requests_served: u64,
 }
 
 impl Drop for Process {
@@ -115,7 +124,7 @@ impl Process {
                 }
             }
         });
-        Ok(Self { child, input, output })
+        Ok(Self { child, input, output, requests_served: 0 })
     }
 
     fn receive(&self, deadline: Instant, current: impl Fn() -> bool) -> Result<Vec<u8>, &'static str> {
@@ -170,6 +179,7 @@ impl Process {
                 response["timeouts"].as_u64().unwrap_or(0), response["solver_failures"].as_u64().unwrap_or(0), outcome.is_ok()));
         }
         if !current() { return Err("persistent_cancelled"); }
+        self.requests_served += 1;
         Ok(outcome)
     }
 }
@@ -186,14 +196,15 @@ fn launch(python: &Path, script: &Path, deadline: Instant, current: impl Fn() ->
 
 fn supervise(python: &Path, script: &Path, timings: bool, receiver: mpsc::Receiver<Request>, latest: Arc<AtomicU64>) {
     // Prewarm asynchronously. Failure is recoverable; the first request may retry.
-    let mut process = launch(python, script, Instant::now() + STARTUP_BUDGET, || true, timings).ok();
+    let mut process = launch(python, script, Instant::now() + STARTUP_BUDGET,
+        || latest.load(Ordering::Acquire) != SHUTDOWN, timings).ok();
     while let Ok(request) = receiver.recv() {
         let current = || latest.load(Ordering::Acquire) == request.id;
         if !current() {
             let _ = request.response.send(Err(error("persistent_cancelled")));
             continue;
         }
-        if timings { trace_event("persistent_begin", format_args!("id={} queue_ms={} reuse={}", request.id, request.started.elapsed().as_millis(), process.is_some())); }
+        if timings { trace_event("persistent_begin", format_args!("id={} queue_ms={} ready={} reuse={}", request.id, request.started.elapsed().as_millis(), process.is_some(), process.as_ref().is_some_and(|p| p.requests_served > 0))); }
         let result = (|| {
             if process.is_none() {
                 let deadline = (Instant::now() + STARTUP_BUDGET).min(request.started + REQUEST_BUDGET);

@@ -44,3 +44,10 @@ $worker = (Resolve-Path ".\experiments\extraction-latency\worker.py").Path
 ```
 
 Switch between videos in the same window. Compare `persistent_ready`, `persistent_begin`, `persistent_reply`, `persistent_recovery`, `yt-dlp-persistent-extract`, `load_requested` and `audio_pts_first_observed` timings. `wire_ms` includes extraction and serialization; compare with `extract_ms` and `serialize_ms`, rather than treating it as pure IPC. The provisional request budget is 12 seconds, including queue time. A stale in-flight request, timeout, broken pipe or invalid response causes the supervisor to discard that process. A failed or unusable extraction, or media failure through the existing playback recovery path, retries standard yt-dlp once. Python is not bundled yet. Killing the Python process does not guarantee termination of all descendants on Windows; packaging and process-tree supervision remain follow-up work. Run the offline protocol test with `python -m unittest discover -s experiments/extraction-latency -p test_worker.py`.
+
+Offline Rust supervisor test (uses the fake worker, not YouTube):
+
+```powershell
+$env:YT_LITE_TEST_PYTHON = $python
+cargo test --test persistent_worker -- --ignored
+```
