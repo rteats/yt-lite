@@ -39,6 +39,63 @@ struct OpenGlFbo {
 
 type RenderUpdate = Option<unsafe extern "C" fn(*mut c_void)>;
 
+// Public client.h ABI for reading the seekable-ranges node. Only numerical
+// fields are copied; no strings, media filenames or URLs leave the bridge.
+#[repr(C)]
+union MpvNodeValue {
+    double: f64,
+    int64: i64,
+    list: *mut MpvNodeList,
+}
+
+#[repr(C)]
+struct MpvNode {
+    value: MpvNodeValue,
+    format: c_int,
+}
+
+#[repr(C)]
+struct MpvNodeList {
+    num: c_int,
+    values: *mut MpvNode,
+    keys: *mut *mut c_char,
+}
+
+impl MpvNode {
+    // SAFETY: only called on a live mpv-owned node before free_node_contents.
+    unsafe fn entries(&self, format: c_int) -> Option<(&MpvNodeList, &[MpvNode])> {
+        if self.format != format { return None; }
+        let list = self.value.list.as_ref()?;
+        if !(0..=4096).contains(&list.num) { return None; }
+        let values = if list.num == 0 {
+            &[]
+        } else {
+            if list.values.is_null() { return None; }
+            std::slice::from_raw_parts(list.values, list.num as usize)
+        };
+        Some((list, values))
+    }
+
+    unsafe fn field(&self, name: &[u8]) -> Option<&MpvNode> {
+        let (list, values) = self.entries(8)?; // MPV_FORMAT_NODE_MAP
+        if list.keys.is_null() { return None; }
+        for (i, value) in values.iter().enumerate() {
+            let key = *list.keys.add(i);
+            if !key.is_null() && CStr::from_ptr(key).to_bytes() == name {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    unsafe fn finite_double(&self) -> Option<f64> {
+        if self.format != 5 { return None; } // MPV_FORMAT_DOUBLE
+        let n = self.value.double;
+        n.is_finite().then_some(n)
+    }
+}
+
+
 #[repr(C)]
 struct MpvEvent {
     event_id: c_int,
@@ -115,6 +172,7 @@ struct Api {
     set_property_string: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     command_async: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
+    free_node_contents: unsafe extern "C" fn(*mut MpvNode),
     render_create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const RenderParam) -> c_int,
     render_free: unsafe extern "C" fn(*mut c_void),
     render_render: unsafe extern "C" fn(*mut c_void, *const RenderParam) -> c_int,
@@ -137,6 +195,7 @@ impl Api {
             set_property_string: get(library, b"mpv_set_property_string\0")?,
             command_async: get(library, b"mpv_command_async\0")?,
             get_property: get(library, b"mpv_get_property\0")?,
+            free_node_contents: get(library, b"mpv_free_node_contents\0")?,
             render_create: get(library, b"mpv_render_context_create\0")?,
             render_free: get(library, b"mpv_render_context_free\0")?,
             render_render: get(library, b"mpv_render_context_render\0")?,
@@ -457,6 +516,27 @@ impl Player {
     pub fn enable_diagnostics(&self) {
         let rc = unsafe { (self.api.request_log_messages)(self.handle, c"v".as_ptr()) };
         if rc < 0 { eprintln!("[yt-lite] mpv verbose diagnostics unavailable code={rc}"); }
+    }
+
+    /// Main demuxer only, as documented by mpv. Missing/invalid nodes are
+    /// unknown, not evidence of a cache miss. Read only before benchmark seeks.
+    pub fn main_cache_ranges(&self) -> Option<Vec<(f64, f64)>> {
+        let mut node = MpvNode { value: MpvNodeValue { int64: 0 }, format: 0 };
+        unsafe {
+            let rc = (self.api.get_property)(self.handle, c"demuxer-cache-state".as_ptr(), 6,
+                (&mut node as *mut MpvNode).cast());
+            if rc < 0 { return None; }
+            let result = (|| {
+                let (_, entries) = node.field(b"seekable-ranges")?.entries(7)?;
+                entries.iter().map(|entry| {
+                    let start = entry.field(b"start")?.finite_double()?;
+                    let end = entry.field(b"end")?.finite_double()?;
+                    (start <= end).then_some((start, end))
+                }).collect::<Option<Vec<_>>>()
+            })();
+            (self.api.free_node_contents)(&mut node);
+            result
+        }
     }
 
     pub fn property_double(&self, name: &CStr) -> Option<f64> {

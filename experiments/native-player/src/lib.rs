@@ -269,3 +269,49 @@ pub fn preattached_audio_command(video: &str, audio: &str) -> Option<Vec<String>
     Some(vec!["loadfile".into(), video.into(), "replace".into(), "-1".into(),
         format!("audio-files-append=%{}%{}", audio.len(), audio)])
 }
+
+
+/// Classify the requested time against the actual seekable ranges reported by
+/// mpv's main demuxer. External audio is not covered by this classification.
+pub fn main_cache_membership(ranges: Option<&[(f64, f64)]>, target: f64) -> &'static str {
+    match ranges {
+        Some(ranges) if target.is_finite() => {
+            if ranges.iter().any(|&(start, end)| start <= target && target <= end) {
+                "inside"
+            } else {
+                "outside"
+            }
+        }
+        _ => "unknown",
+    }
+}
+
+/// Explicit seek precision for the diagnostic A/B only. Normal UI commands
+/// retain the current default precision and behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekBenchmarkMode {
+    Exact,
+    Keyframes,
+}
+
+impl SeekBenchmarkMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "exact" => Some(Self::Exact),
+            "keyframes" => Some(Self::Keyframes),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Keyframes => "keyframes",
+        }
+    }
+
+    pub fn command(self, target: f64) -> Option<Vec<String>> {
+        if !target.is_finite() || target < 0.0 { return None; }
+        Some(vec!["seek".into(), format!("{target:.3}"), format!("absolute+{}", self.label())])
+    }
+}

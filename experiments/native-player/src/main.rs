@@ -3,6 +3,7 @@
 //! Experimental local-file and YouTube URL playback, not a release-ready watch page.
 
 mod mpv;
+mod seek_benchmark;
 
 use mpv::{PlaybackEvent, Player};
 use yt_lite_extraction_proof::persistent::PersistentWorker;
@@ -511,6 +512,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lean_metadata = false;
     let mut fast_extraction = false;
     let mut preattach_audio = false;
+    let mut seek_benchmark_mode = None;
     let mut persistent_extraction = false;
     let mut worker_python = PathBuf::from("python");
     let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
@@ -521,6 +523,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--lean-metadata" => lean_metadata = true,
             "--fast-extraction" => fast_extraction = true,
             "--preattach-audio" => preattach_audio = true,
+            "--seek-benchmark" => {
+                let mode = args.next().ok_or("Missing --seek-benchmark exact|keyframes")?;
+                seek_benchmark_mode = Some(yt_lite_native_player_proof::SeekBenchmarkMode::parse(&mode)
+                    .ok_or("Seek benchmark mode must be exact or keyframes")?);
+                profile_timings = true;
+            }
             "--persistent-extraction" => persistent_extraction = true,
             "--worker-python" => worker_python = PathBuf::from(args.next().ok_or("Missing --worker-python PATH")?),
             "--worker-script" => worker_script = PathBuf::from(args.next().ok_or("Missing --worker-script PATH")?),
@@ -573,6 +581,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
+    if seek_benchmark_mode.is_some() && remote_url.is_none() {
+        return Err("Seek benchmark requires a startup YouTube watch URL".into());
+    }
     let initial_provider = preferred_playback_provider(requested_provider);
     let persistent = if persistent_extraction {
         eprintln!("[yt-lite] experimental persistent extraction enabled (standard fallback retained)");
@@ -795,8 +806,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut awaiting_seek_audio: Option<(u64, Instant)> = None;
     let mut previous_wait_state = None;
     let mut last_tick = Instant::now();
+    let mut seek_benchmark = seek_benchmark_mode.map(seek_benchmark::SeekBenchmark::new);
     let clock = Timer::default();
-    clock.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+    let tick_ms = if seek_benchmark.is_some() { 50 } else { 250 };
+    clock.start(TimerMode::Repeated, Duration::from_millis(tick_ms), move || {
         let now = Instant::now();
         if profile_timings && now.duration_since(last_tick) > Duration::from_millis(500) {
             trace_event("ui_timer_gap", format_args!("gap_ms={}", now.duration_since(last_tick).as_millis()));
@@ -940,6 +953,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A new watch URL replaces the current playback session but does not
         // construct a new libmpv core. In-flight extraction results are dropped.
         if let Some(input) = requested_url.borrow_mut().take() {
+            if let Some(bench) = seek_benchmark.as_mut() { bench.abort("video_replaced"); }
             match canonical_video_url(input.trim()) {
                 Ok((_, canonical)) => {
                     let _ = label_player.borrow().send_strings(&["stop".into()]);
@@ -1003,6 +1017,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Unlike the earlier prototype, consume the mpv event queue. An
         // accepted asynchronous loadfile command does NOT mean media loaded.
         for event in label_player.borrow().poll_events() {
+            if let Some(bench) = seek_benchmark.as_mut() { bench.on_event(event); }
             if profile_timings {
                 trace_event("mpv_event", format_args!("load={active_trace:?} seek={:?} kind={event:?}", pending_seek_timing.borrow().as_ref().map(|(id, _)| *id)));
             }
@@ -1207,6 +1222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(err) = failure {
+            if let Some(bench) = seek_benchmark.as_mut() { bench.abort("playback_failure"); }
             // If high-resolution split A/V failed, use the already-extracted
             // combined stream before contacting another extractor. Never
             // persist or log signed CDN URLs.
@@ -1347,7 +1363,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // During startup/seek, sample at the existing 250ms UI tick; during
+        if let Some(bench) = seek_benchmark.as_mut() {
+            bench.tick(&label_player.borrow(), has_network_media && file_loaded && !resolving && playback_error.is_none());
+        }
+
+        // During startup/seek, sample at the UI tick; during
         // steady playback report transitions and sparse samples only.
         if profile_timings && has_network_media {
             let player = label_player.borrow();
