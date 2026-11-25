@@ -137,3 +137,16 @@ Hypothesis: if external audio bytes are available locally, uncached seek needs o
 Use the same original fixture and 500 ms delay, three modes External, BufferedAudio (4 MiB payload cap), BufferRejected (64 KiB cap). On first normal video GET, prefetch small synthetic audio in a worker using a real loopback HTTP range request to fixed /prefetch/audio.m4a; validate status, exact content range/length, retain complete bytes in memory only if within cap. The fixture knows immutable file size up front; oversized audio skips prefetch entirely. Subsequent audio range requests use retained bytes and bypass artificial upstream delay, video always uses ordinary delayed file retrieval. HEAD readiness does not start prefetch. If audio arrives before prefetch ready, wait at most 3 s then use ordinary path if absent. No fault injection or generation paths combined. This is a controlled simulated audio cache, not a production CDN proxy or independent packet-cache configuration. Full short audio is prefetched only in diagnostic mode, no video prefetch, no new Rust code or production defaults. Payload cap is not total Python RSS; real unknown-size/CDN validation, bandwidth budgeting and cancellation remain future work.
 
 Expected: BufferedAudio 6/6 exact landings and outside median near 500–700ms vs ~1059ms, prefetch ready before audio demand if probing remains sequential, one prefetch origin GET, local audio hit labels, video request latency unchanged; BufferRejected behaves like baseline and records over_budget, no prefetch GET. Compare total startup and origin bytes, not just seek latency. If no seek gain despite audio hits, investigate decode or synchronization instead. If gain, assess bounded chunk cache and known-length policy for remote use before implementing production transport. All outcomes pending Windows validation.
+
+
+### P15 preliminary HTTP-only validation (chat container, not mpv)
+
+All five range-fixture unittest cases passed in 2.014s, including the two new cache cases. Test files checked against committed Git blobs (audio_prefetch.py 9010d52, range_fixture.py cf6b93c, test_range_fixture.py 9d8b1ff). Separate HTTP client control: synthetic 1,541,755-byte audio payload and 100,000-byte video payload; first video GET then two audio GETs, each 100 bytes, with 500ms injected response delay. Times measured from client request to response headers:
+
+| Cap | Video | First audio | Subsequent audio | Prefetch |
+|---|---:|---:|---:|---|
+| Disabled | 502ms | 502ms | 501ms | None |
+| 4MiB | 502ms | 2ms | 1ms | 1,541,755 bytes in 503ms, starts alongside video |
+| 64KiB | 502ms | 501ms | 501ms | Rejected before fetch |
+
+Range responses returned 206 and exact requested length. Demonstrates simulated upstream wait can be hidden and cap enforced; not a media seek result, not an estimate of real bandwidth (control requests only 100 bytes; buffering transfers substantially more), and not a Windows/Rust/remote integration test. Need actual mpv startup/seek timings from three runner cases before deciding on production design.
