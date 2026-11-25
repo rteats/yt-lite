@@ -536,6 +536,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut audio_cache = false;
     let mut seek_benchmark_mode = None;
     let mut seek_probe = false;
+    let mut seek_recovery = false;
     let mut seek_fault_marker: Option<PathBuf> = None;
     let mut seek_fixture_audio: Option<PathBuf> = None;
     let mut seek_cache_expanded = false;
@@ -569,6 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--seek-http-edl" => seek_http_edl = true,
             "--seek-probe" => seek_probe = true,
+            "--seek-recovery" => { seek_recovery = true; seek_probe = true; },
             "--seek-fault-marker" => seek_fault_marker = Some(PathBuf::from(args.next().ok_or("Missing --seek-fault-marker PATH")?)),
             "--seek-http-fixture" => {
                 let port: u16 = args.next().ok_or("Missing --seek-http-fixture PORT")?.parse()?;
@@ -657,6 +659,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if seek_http_fixture.is_some() && (clip.is_none() || seek_fixture_audio.is_some()) {
         return Err("HTTP fixture requires a local video path as fixture marker and no --seek-fixture-audio".into());
+    }
+    if seek_recovery && (seek_http_fixture.is_none() || seek_http_edl || seek_benchmark_mode != Some(yt_lite_native_player_proof::SeekBenchmarkMode::Exact)) {
+        return Err("--seek-recovery requires exact external-audio loopback seek benchmark".into());
     }
     if seek_probe && (seek_benchmark_mode.is_none() || !observed_state) { return Err("--seek-probe requires --seek-benchmark and --observed-state".into()); }
     if seek_fault_marker.is_some() && (seek_http_fixture.is_none() || seek_benchmark_mode.is_none() || seek_http_edl) {
@@ -928,7 +933,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut awaiting_seek_audio: Option<(u64, Instant)> = None;
     let mut previous_wait_state = None;
     let mut last_tick = Instant::now();
-    let mut seek_benchmark = seek_benchmark_mode.map(|mode| seek_benchmark::SeekBenchmark::new(mode, seek_probe, seek_fault_marker));
+    let mut seek_benchmark = seek_benchmark_mode.map(|mode| seek_benchmark::SeekBenchmark::new(mode, seek_probe, seek_fault_marker, seek_recovery));
     struct TickDuration(Option<Instant>);
     impl Drop for TickDuration {
         fn drop(&mut self) {
@@ -1166,7 +1171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         explicit_audio_open_failure = true;
                     }
                 }
-                PlaybackEvent::Diagnostic(_) | PlaybackEvent::Seek | PlaybackEvent::AudioReconfig | PlaybackEvent::VideoReconfig => {}
+                PlaybackEvent::Diagnostic(_) | PlaybackEvent::Seek | PlaybackEvent::AudioReconfig | PlaybackEvent::VideoReconfig | PlaybackEvent::SeekAudioReloadReply(_) => {}
                 PlaybackEvent::StartFile => {
                     // This may also fire when retrying; do not interpret as playback.
                 }
@@ -1613,6 +1618,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(bench) = seek_benchmark.as_mut() {
             bench.tick(&label_player.borrow(), (has_network_media || clip_source.borrow().is_some()) && file_loaded && !resolving && playback_error.is_none());
+            if bench.take_recovery_failure() {
+                playback_error = Some("Seek recovery failed: required audio unavailable.".into());
+                file_loaded = false;
+                has_network_media = false;
+                if let Some(ui) = label_window.upgrade() { ui.set_has_media(false); ui.set_can_retry(false); }
+            }
         }
 
         // During startup/seek, sample at the UI tick; during

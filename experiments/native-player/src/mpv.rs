@@ -120,6 +120,7 @@ pub enum PlaybackEvent {
     LoadFailed(i32),
     ExternalAudioAdded,
     ExternalAudioFailed(i32),
+    SeekAudioReloadReply(i32),
     Ended,
     Seek,
     AudioReconfig,
@@ -316,6 +317,8 @@ pub struct Player {
     pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
     seek_probes: RefCell<Vec<SeekProbe>>,
+    seek_audio_reload_reply: Cell<Option<u64>>,
+    seek_missing_confirmation: Cell<Option<(usize, Instant)>>,
     expected_preattached_audio: RefCell<Option<String>>,
     audio_cache: RefCell<Option<yt_lite_native_player_proof::audio_cache::AudioCache>>,
     last_video_margins: Option<(u64, u64, u64)>,
@@ -356,6 +359,8 @@ impl Player {
             pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
             seek_probes: RefCell::new(Vec::new()),
+            seek_audio_reload_reply: Cell::new(None),
+            seek_missing_confirmation: Cell::new(None),
             expected_preattached_audio: RefCell::new(None),
             audio_cache: RefCell::new(None),
             last_video_margins: None,
@@ -510,6 +515,19 @@ impl Player {
         Ok(())
     }
 
+    /// Reopen selected external audio. Separate reply ID from startup audio-add.
+    pub fn reload_seek_audio(&self) -> Result<(), String> {
+        let reply = self.allocate_reply();
+        self.send_command(&["audio-reload".into()], reply)?;
+        self.seek_audio_reload_reply.set(Some(reply));
+        self.seek_missing_confirmation.set(None);
+        Ok(())
+    }
+
+    pub fn take_seek_missing_confirmation(&self, sample: usize) -> bool {
+        self.seek_missing_confirmation.take().is_some_and(|(index, at)| index == sample && at.elapsed() <= std::time::Duration::from_millis(500))
+    }
+
     /// mpv renders to the full GL framebuffer; reserve Slint chrome as
     /// margins so the *video picture* is confined to the visible center.
     /// Avoid setting properties on every frame; update only on geometry/DPI
@@ -565,6 +583,8 @@ impl Player {
             self.pending_audio_reply.set(None);
             self.pending_load_reply.set(None);
             self.seek_probes.borrow_mut().clear();
+            self.seek_audio_reload_reply.set(None);
+            self.seek_missing_confirmation.set(None);
             self.expected_preattached_audio.borrow_mut().take();
             self.audio_cache.borrow_mut().take();
             self.observed_file_loaded.set(false);
@@ -621,6 +641,7 @@ impl Player {
                     }
                 }
                 MPV_EVENT_SEEK => {
+                    self.seek_missing_confirmation.set(None);
                     if self.observed_file_loaded.get() { self.reset_observations(true); }
                     events.push(PlaybackEvent::Seek);
                 }
@@ -643,6 +664,10 @@ impl Player {
                 MPV_EVENT_COMMAND_REPLY if self.pending_load_reply.get() == Some(event.reply_userdata) => {
                     self.pending_load_reply.set(None);
                     if event.error < 0 { events.push(PlaybackEvent::LoadFailed(event.error)); }
+                }
+                MPV_EVENT_COMMAND_REPLY if self.seek_audio_reload_reply.get() == Some(event.reply_userdata) => {
+                    self.seek_audio_reload_reply.set(None);
+                    events.push(PlaybackEvent::SeekAudioReloadReply(event.error));
                 }
                 MPV_EVENT_COMMAND_REPLY if self.pending_audio_reply.get() == Some(event.reply_userdata) => {
                     self.pending_audio_reply.set(None);
@@ -718,6 +743,10 @@ impl Player {
         } else {
             self.property_flag(probe.name).map(|v| if v { 1.0 } else { 0.0 })
         };
+        if probe.phase == "recovery_confirm" && probe.name == c"audio-pts" && event.error == -10
+            && probe.started.elapsed() <= std::time::Duration::from_millis(500) {
+            self.seek_missing_confirmation.set(Some((probe.sample, Instant::now())));
+        }
         yt_lite_extraction_proof::trace_event("seek_probe_reply", format_args!(
             "sample={} phase={} property={} elapsed_ms={} code={} requested_observed={:?} reply={value:?} current_observed={observed_now:?}",
             probe.sample, probe.phase, probe.name.to_string_lossy(), probe.started.elapsed().as_millis(), event.error, probe.observed_at_request));
