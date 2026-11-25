@@ -101,7 +101,7 @@ impl SeekBenchmark {
             return;
         }
         if self.phase_started.elapsed() >= START_TIMEOUT {
-            self.abort("settle_timeout");
+            self.abort(if self.next == 0 && audio.is_none() { "startup_audio_unavailable" } else { "settle_timeout" });
             return;
         }
         if !ready { self.ready_since = None; return; }
@@ -128,5 +128,11 @@ impl SeekBenchmark {
         }
         self.active = Some(Sample { index, target, started, seek_ms: None, restart_ms: None, landing: None });
         self.ready_since = None;
+    }
+}
+
+impl Drop for SeekBenchmark {
+    fn drop(&mut self) {
+        self.abort("closed_before_completion");
     }
 }

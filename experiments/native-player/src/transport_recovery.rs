@@ -54,3 +54,13 @@ pub fn transport_diagnostic(text: &str) -> Option<&'static str> {
         Some("demux_error")
     } else { None }
 }
+
+
+/// FILE_LOADED alone cannot establish A/V readiness. Missing flags or audio
+/// output configuration are not success.
+pub fn startup_av_ready(video: Option<f64>, audio: Option<f64>, seeking: Option<bool>,
+    buffering: Option<bool>, paused: Option<bool>, output_hz: Option<f64>) -> bool {
+    seeking == Some(false) && buffering == Some(false) && paused == Some(false)
+        && output_hz.is_some_and(|hz| hz.is_finite() && hz > 0.0)
+        && video.zip(audio).is_some_and(|(v,a)| v.is_finite() && a.is_finite() && (v-a).abs() <= 0.5)
+}
