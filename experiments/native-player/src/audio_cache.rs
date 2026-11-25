@@ -134,9 +134,11 @@ impl Drop for AudioCache {
 }
 
 async fn fetch(session: &Session, headers: HttpPlaybackHeaders) -> Result<Payload, &'static str> {
-    let client = Client::builder().redirect(reqwest::redirect::Policy::none())
-        .timeout(PREFETCH_TIMEOUT).build().map_err(|_| "client")?;
-    let mut request = client.get(&session.origin)
+    let builder = Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(PREFETCH_TIMEOUT);
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    let client = builder.build().map_err(|_| "client")?;
+    let mut request = client.get(session.origin.as_str())
         .header(header::RANGE, format!("bytes=0-{}", session.size - 1))
         .header(header::ACCEPT_ENCODING, "identity");
     if let Some(agent) = headers.user_agent { request = request.header(header::USER_AGENT, agent); }
@@ -180,7 +182,8 @@ fn prefetch(session: Arc<Session>, headers: HttpPlaybackHeaders) {
     let began = Instant::now();
     trace_event("audio_cache_begin", format_args!("load={} bytes={} cap={MAX_AUDIO_BYTES}", session.id, session.size));
     let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(runtime) => runtime.block_on(async {
+        Ok(runtime) => {
+            let result = runtime.block_on(async {
             let future = fetch(&session, headers);
             tokio::pin!(future);
             loop {
@@ -188,7 +191,12 @@ fn prefetch(session: Arc<Session>, headers: HttpPlaybackHeaders) {
                 if began.elapsed() >= PREFETCH_TIMEOUT { break Err("timeout"); }
                 if let Ok(result) = tokio::time::timeout(IO_POLL, future.as_mut()).await { break result; }
             }
-        }),
+            });
+            // A platform DNS lookup may outlive the async request. Do not hold
+            // the cache lease waiting indefinitely for blocking runtime work.
+            runtime.shutdown_timeout(Duration::from_millis(200));
+            result
+        }
         Err(_) => Err("runtime"),
     };
     let mut state = session.state.lock().unwrap();
@@ -382,10 +390,15 @@ mod tests {
                 if n == 0 { return; }
                 request.extend_from_slice(&b[..n]);
             }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.contains("range: bytes=0-9\r\n"));
+            assert!(request.contains("user-agent: test-audio-cache\r\n"));
+            assert!(request.contains("referer: https://www.youtube.com/\r\n"));
             release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             let _ = conn.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/10\r\nContent-Length: 10\r\nContent-Type: audio/mp4\r\nConnection: close\r\n\r\n0123456789");
         });
-        let cache = AudioCache::start_known(&upstream,10,&HttpPlaybackHeaders::default(),1).unwrap();
+        let headers = HttpPlaybackHeaders { user_agent: Some("test-audio-cache".into()), referer: Some("https://www.youtube.com/".into()) };
+        let cache = AudioCache::start_known(&upstream,10,&headers,1).unwrap();
         release_tx.send(()).unwrap();
         let deadline = Instant::now()+Duration::from_secs(4);
         while !matches!(*cache.session.state.lock().unwrap(), State::Ready(_)) {

@@ -641,6 +641,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
+    if audio_cache && clip.is_some() { return Err("--audio-cache supports remote playback only".into()); }
     if (seek_cache_expanded || seek_fixture_audio.is_some() || seek_http_fixture.is_some()) && seek_benchmark_mode.is_none() {
         return Err("Fixture and cache options require --seek-benchmark".into());
     }
@@ -903,6 +904,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut recovery_started: Option<Instant> = None;
     let mut startup_complete = false;
     let mut startup_split = false;
+    // At most one experimental audio-cache attempt per explicitly selected watch.
+    let mut audio_cache_attempted = false;
     let mut explicit_audio_open_failure = false;
     let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let mut used_native_ejs = false;
@@ -1099,6 +1102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recovery_started = None;
                     startup_complete = false;
                     startup_split = false;
+                    audio_cache_attempted = false;
                     *browser_url.borrow_mut() = Some(canonical.clone());
                     clip_source.borrow_mut().take();
                     media_title = None;
@@ -1379,10 +1383,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if profile_timings { trace_event("load_requested", format_args!("load={active_trace:?} preattached={preattached}")); }
                         let result = if let Some((video, audio, headers)) = preattach_retry.as_ref() {
                             // Retry bookkeeping retains the original CDN URL, never the local endpoint.
-                            if audio_cache && stream.audio_direct_http {
+                            if audio_cache && !audio_cache_attempted && stream.audio_direct_http {
+                                audio_cache_attempted = true;
                                 label_player.borrow_mut().load_network_with_cached_audio(video, audio, headers, active_trace.unwrap_or_else(trace_id))
                             } else {
-                                if audio_cache { trace_event("audio_cache_skip", format_args!("load={active_trace:?} reason=unsupported_protocol")); }
+                                if audio_cache { trace_event("audio_cache_skip", format_args!("load={active_trace:?} reason={}", if audio_cache_attempted { "already_attempted" } else { "unsupported_protocol" })); }
                                 label_player.borrow_mut().load_network_with_audio(video, audio, headers)
                             }
                         } else {
