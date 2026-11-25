@@ -61,6 +61,7 @@ struct Session {
     stopped: AtomicBool,
     cancel_fetch: AtomicBool,
     clients: AtomicUsize,
+    received_bytes: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -106,7 +107,7 @@ impl AudioCache {
         let session = Arc::new(Session {
             id, origin: origin.into(), path: path.clone(), size,
             stopped: AtomicBool::new(false), cancel_fetch: AtomicBool::new(false),
-            clients: AtomicUsize::new(0), state: Mutex::new(State::Pending),
+            clients: AtomicUsize::new(0), received_bytes: AtomicUsize::new(0), state: Mutex::new(State::Pending),
         });
         let cache = Self { url: format!("http://127.0.0.1:{port}{path}"), session: session.clone() };
         let serving = session.clone();
@@ -143,7 +144,9 @@ async fn fetch(session: &Session, headers: HttpPlaybackHeaders) -> Result<Payloa
         .header(header::ACCEPT_ENCODING, "identity");
     if let Some(agent) = headers.user_agent { request = request.header(header::USER_AGENT, agent); }
     if let Some(referer) = headers.referer { request = request.header(header::REFERER, referer); }
+    let request_started = Instant::now();
     let mut response = request.send().await.map_err(|_| "request")?;
+    trace_event("audio_cache_headers", format_args!("load={} status={} elapsed_ms={}", session.id, response.status().as_u16(), request_started.elapsed().as_millis()));
     let h = response.headers();
     let expected_range = format!("bytes 0-{}/{}", session.size - 1, session.size);
     let range = h.get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok());
@@ -172,7 +175,10 @@ async fn fetch(session: &Session, headers: HttpPlaybackHeaders) -> Result<Payloa
     let mut bytes = Vec::with_capacity(session.size);
     while let Some(chunk) = response.chunk().await.map_err(|_| "body")? {
         if chunk.len() > session.size - bytes.len() { return Err("oversized_body"); }
+        let first = bytes.is_empty() && !chunk.is_empty();
         bytes.extend_from_slice(&chunk);
+        session.received_bytes.store(bytes.len(), Ordering::Release);
+        if first { trace_event("audio_cache_first_body", format_args!("load={} bytes={} elapsed_ms={}", session.id, bytes.len(), request_started.elapsed().as_millis())); }
     }
     if bytes.len() != session.size { return Err("short_body"); }
     Ok(Payload { bytes, mime })
@@ -201,7 +207,7 @@ fn prefetch(session: Arc<Session>, headers: HttpPlaybackHeaders) {
     };
     let mut state = session.state.lock().unwrap();
     if !matches!(*state, State::Pending) || session.cancel_fetch.load(Ordering::Acquire) {
-        trace_event("audio_cache_end", format_args!("load={} status=cancelled elapsed_ms={}", session.id, began.elapsed().as_millis()));
+        trace_event("audio_cache_end", format_args!("load={} status=cancelled received_bytes={} elapsed_ms={}", session.id, session.received_bytes.load(Ordering::Acquire), began.elapsed().as_millis()));
         return;
     }
     match result {
@@ -210,7 +216,7 @@ fn prefetch(session: Arc<Session>, headers: HttpPlaybackHeaders) {
             *state = State::Ready(Arc::new(payload));
         }
         Err(reason) => {
-            trace_event("audio_cache_end", format_args!("load={} status=bypass reason={reason} elapsed_ms={}", session.id, began.elapsed().as_millis()));
+            trace_event("audio_cache_end", format_args!("load={} status=bypass reason={reason} received_bytes={} elapsed_ms={}", session.id, session.received_bytes.load(Ordering::Acquire), began.elapsed().as_millis()));
             *state = State::Bypass;
         }
     }

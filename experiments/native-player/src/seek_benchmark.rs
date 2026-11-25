@@ -87,6 +87,10 @@ impl SeekBenchmark {
                     }
                 }
             }
+            if self.probe && sample.restart_ms.is_some() && !ready && sample.probes & 8 == 0 {
+                sample.probes |= 8;
+                player.request_seek_probe(sample.index, "restart_unready", sample.target);
+            }
             if sample.restart_ms.is_some() && sample.landing.is_none() && seeking == Some(false) {
                 sample.landing = position;
             }
