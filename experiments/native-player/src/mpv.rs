@@ -5,12 +5,13 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
+use yt_lite_native_player_proof::observed_state::{ObservedState, ObservedValue};
 use yt_lite_native_player_proof::{diagnostic_stream_hint, preattached_audio_command, search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
 use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{c_char, c_int, c_void, CStr, CString},
     path::Path,
     ptr,
@@ -133,6 +134,37 @@ const MPV_EVENT_LOG_MESSAGE: c_int = 2;
 const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
 const MPV_EVENT_AUDIO_RECONFIG: c_int = 18;
 const MPV_EVENT_SEEK: c_int = 20;
+const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+const MPV_EVENT_QUEUE_OVERFLOW: c_int = 24;
+const MPV_FORMAT_NONE: c_int = 0;
+const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_DOUBLE: c_int = 5;
+const MPV_FORMAT_NODE: c_int = 6;
+
+#[repr(C)]
+struct MpvEventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
+const OBSERVED_PROPERTIES: &[(&str, &CStr, c_int)] = &[
+    ("time-pos", c"time-pos", MPV_FORMAT_DOUBLE),
+    ("duration", c"duration", MPV_FORMAT_DOUBLE),
+    ("audio-pts", c"audio-pts", MPV_FORMAT_DOUBLE),
+    ("pause", c"pause", MPV_FORMAT_FLAG),
+    ("seeking", c"seeking", MPV_FORMAT_FLAG),
+    ("paused-for-cache", c"paused-for-cache", MPV_FORMAT_FLAG),
+    ("demuxer-cache-duration", c"demuxer-cache-duration", MPV_FORMAT_DOUBLE),
+    ("cache-buffering-state", c"cache-buffering-state", MPV_FORMAT_DOUBLE),
+    ("cache-speed", c"cache-speed", MPV_FORMAT_DOUBLE),
+    ("avsync", c"avsync", MPV_FORMAT_DOUBLE),
+    ("audio-params/samplerate", c"audio-params/samplerate", MPV_FORMAT_DOUBLE),
+    ("audio-out-params/samplerate", c"audio-out-params/samplerate", MPV_FORMAT_DOUBLE),
+    ("mute", c"mute", MPV_FORMAT_FLAG),
+    ("eof-reached", c"eof-reached", MPV_FORMAT_FLAG),
+    ("demuxer-cache-state", c"demuxer-cache-state", MPV_FORMAT_NODE),
+];
 
 #[repr(C)]
 struct MpvLogMessage {
@@ -174,6 +206,8 @@ struct Api {
     command_async: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
     free_node_contents: unsafe extern "C" fn(*mut MpvNode),
+    observe_property: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
+    unobserve_property: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
     render_create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const RenderParam) -> c_int,
     render_free: unsafe extern "C" fn(*mut c_void),
     render_render: unsafe extern "C" fn(*mut c_void, *const RenderParam) -> c_int,
@@ -197,6 +231,8 @@ impl Api {
             command_async: get(library, b"mpv_command_async\0")?,
             get_property: get(library, b"mpv_get_property\0")?,
             free_node_contents: get(library, b"mpv_free_node_contents\0")?,
+            observe_property: get(library, b"mpv_observe_property\0")?,
+            unobserve_property: get(library, b"mpv_unobserve_property\0")?,
             render_create: get(library, b"mpv_render_context_create\0")?,
             render_free: get(library, b"mpv_render_context_free\0")?,
             render_render: get(library, b"mpv_render_context_render\0")?,
@@ -260,6 +296,8 @@ pub struct Player {
     wake: Option<Box<Wake>>,
     loaded: bool,
     profile_calls: Cell<bool>,
+    observed: RefCell<Option<ObservedState>>,
+    observed_file_loaded: Cell<bool>,
     next_reply: Cell<u64>,
     pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
@@ -295,6 +333,8 @@ impl Player {
             wake: None,
             loaded: false,
             profile_calls: Cell::new(false),
+            observed: RefCell::new(None),
+            observed_file_loaded: Cell::new(false),
             next_reply: Cell::new(FIRST_REPLY_ID),
             pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
@@ -484,6 +524,8 @@ impl Player {
         if matches!(args.first().map(String::as_str), Some("stop" | "loadfile")) {
             self.pending_audio_reply.set(None);
             self.pending_load_reply.set(None);
+            self.observed_file_loaded.set(false);
+            self.reset_observations(false);
         }
         Ok(())
     }
@@ -491,13 +533,27 @@ impl Player {
     /// Nonblocking mpv event processing. Never include event payload filenames
     /// or streaming URLs in diagnostics; only expose numeric error codes.
     pub fn poll_events(&self) -> Vec<PlaybackEvent> {
+        let started = self.profile_calls.get().then(Instant::now);
         let mut events = Vec::new();
-        for _ in 0..64 {
+        // Property events are coalesced behind queued lifecycle/log events.
+        // Bound work while allowing the observed mode to drain a larger burst.
+        let budget = if self.observed.borrow().is_some() { 256 } else { 64 };
+        for i in 0..budget {
             let ptr = unsafe { (self.api.wait_event)(self.handle, 0.0) };
             if ptr.is_null() { break; }
             let event = unsafe { &*ptr };
             if event.event_id == MPV_EVENT_NONE { break; }
+            if i + 1 == budget && self.profile_calls.get() {
+                yt_lite_extraction_proof::trace_event("mpv_event_budget", format_args!("events={budget}"));
+            }
             match event.event_id {
+                MPV_EVENT_PROPERTY_CHANGE if !event.data.is_null() => {
+                    self.apply_property_event(event.reply_userdata, unsafe { &*event.data.cast::<MpvEventProperty>() });
+                }
+                MPV_EVENT_QUEUE_OVERFLOW => {
+                    if self.profile_calls.get() { yt_lite_extraction_proof::trace_event("mpv_queue_overflow", format_args!("observed={}", self.observed.borrow().is_some())); }
+                    self.reset_observations(self.observed_file_loaded.get());
+                }
                 MPV_EVENT_LOG_MESSAGE if !event.data.is_null() => {
                     let msg = unsafe { &*event.data.cast::<MpvLogMessage>() };
                     if !msg.text.is_null() {
@@ -516,12 +572,26 @@ impl Player {
                         }
                     }
                 }
-                MPV_EVENT_SEEK => events.push(PlaybackEvent::Seek),
+                MPV_EVENT_SEEK => {
+                    if self.observed_file_loaded.get() { self.reset_observations(true); }
+                    events.push(PlaybackEvent::Seek);
+                }
                 MPV_EVENT_AUDIO_RECONFIG => events.push(PlaybackEvent::AudioReconfig),
                 MPV_EVENT_VIDEO_RECONFIG => events.push(PlaybackEvent::VideoReconfig),
-                MPV_EVENT_START_FILE => events.push(PlaybackEvent::StartFile),
-                MPV_EVENT_FILE_LOADED => events.push(PlaybackEvent::FileLoaded),
-                MPV_EVENT_PLAYBACK_RESTART => events.push(PlaybackEvent::PlaybackRestart),
+                MPV_EVENT_START_FILE => {
+                    self.observed_file_loaded.set(false);
+                    self.reset_observations(false);
+                    events.push(PlaybackEvent::StartFile);
+                }
+                MPV_EVENT_FILE_LOADED => {
+                    self.observed_file_loaded.set(true);
+                    self.reset_observations(true);
+                    events.push(PlaybackEvent::FileLoaded);
+                }
+                MPV_EVENT_PLAYBACK_RESTART => {
+                    if self.observed_file_loaded.get() { self.reset_observations(true); }
+                    events.push(PlaybackEvent::PlaybackRestart);
+                }
                 MPV_EVENT_COMMAND_REPLY if self.pending_load_reply.get() == Some(event.reply_userdata) => {
                     self.pending_load_reply.set(None);
                     if event.error < 0 { events.push(PlaybackEvent::LoadFailed(event.error)); }
@@ -536,6 +606,8 @@ impl Player {
                 }
                 MPV_EVENT_END_FILE if !event.data.is_null() => {
                     let end = unsafe { &*event.data.cast::<MpvEndFile>() };
+                    self.observed_file_loaded.set(false);
+                    self.reset_observations(false);
                     if end.reason == MPV_END_FILE_REASON_ERROR {
                         events.push(PlaybackEvent::LoadFailed(end.error));
                     } else if end.reason == 0 {
@@ -545,7 +617,50 @@ impl Player {
                 _ => {}
             }
         }
+        self.report_slow_call(started, "poll_events", c"event-queue");
         events
+    }
+
+    pub fn enable_observed_state(&self) {
+        *self.observed.borrow_mut() = Some(ObservedState::default());
+        eprintln!("[yt-lite] experimental observed playback state enabled");
+    }
+
+    fn reset_observations(&self, active: bool) {
+        let mut observed = self.observed.borrow_mut();
+        let Some(state) = observed.as_mut() else { return; };
+        let started = self.profile_calls.get().then(Instant::now);
+        if let Some(old) = state.active_id() {
+            unsafe { (self.api.unobserve_property)(self.handle, old); }
+        }
+        if let Some(id) = state.reset(active) {
+            for &(name, c_name, format) in OBSERVED_PROPERTIES {
+                let rc = unsafe { (self.api.observe_property)(self.handle, id, c_name.as_ptr(), format) };
+                if rc < 0 { eprintln!("[yt-lite] observe unavailable property={name} code={rc}"); }
+            }
+        }
+        self.report_slow_call(started, "observe_reset", c"playback-state");
+    }
+
+    fn apply_property_event(&self, id: u64, property: &MpvEventProperty) {
+        let mut observed = self.observed.borrow_mut();
+        let Some(state) = observed.as_mut() else { return; };
+        if state.active_id() != Some(id) || property.name.is_null() { return; }
+        let name = unsafe { CStr::from_ptr(property.name) };
+        let Some(&(key, _, expected)) = OBSERVED_PROPERTIES.iter().find(|(_, candidate, _)| *candidate == name) else { return; };
+        // mpv owns event data until the next wait_event. Copy scalars and
+        // only numerical cache ranges before returning; never free event data.
+        let value = if property.format == MPV_FORMAT_NONE || property.data.is_null() || property.format != expected {
+            None
+        } else { unsafe {
+            match expected {
+                MPV_FORMAT_DOUBLE => Some(ObservedValue::Double(*property.data.cast::<f64>())),
+                MPV_FORMAT_FLAG => Some(ObservedValue::Flag(*property.data.cast::<c_int>() != 0)),
+                MPV_FORMAT_NODE => Self::copy_cache_ranges(&*property.data.cast::<MpvNode>()).map(ObservedValue::Ranges),
+                _ => None,
+            }
+        } };
+        state.update(id, key, value);
     }
 
     pub fn enable_diagnostics(&self) {
@@ -557,6 +672,7 @@ impl Player {
     /// Main demuxer only, as documented by mpv. Missing/invalid nodes are
     /// unknown, not evidence of a cache miss. Read only before benchmark seeks.
     pub fn main_cache_ranges(&self) -> Option<Vec<(f64, f64)>> {
+        if let Some(state) = self.observed.borrow().as_ref() { return state.ranges(); }
         let mut node = MpvNode { value: MpvNodeValue { int64: 0 }, format: 0 };
         unsafe {
             let started = self.profile_calls.get().then(Instant::now);
@@ -564,17 +680,19 @@ impl Player {
                 (&mut node as *mut MpvNode).cast());
             self.report_slow_call(started, "get_node", c"demuxer-cache-state");
             if rc < 0 { return None; }
-            let result = (|| {
-                let (_, entries) = node.field(b"seekable-ranges")?.entries(7)?;
-                entries.iter().map(|entry| {
-                    let start = entry.field(b"start")?.finite_double()?;
-                    let end = entry.field(b"end")?.finite_double()?;
-                    (start <= end).then_some((start, end))
-                }).collect::<Option<Vec<_>>>()
-            })();
+            let result = Self::copy_cache_ranges(&node);
             (self.api.free_node_contents)(&mut node);
             result
         }
+    }
+
+    unsafe fn copy_cache_ranges(node: &MpvNode) -> Option<Vec<(f64, f64)>> {
+        let (_, entries) = node.field(b"seekable-ranges")?.entries(7)?;
+        entries.iter().map(|entry| {
+            let start = entry.field(b"start")?.finite_double()?;
+            let end = entry.field(b"end")?.finite_double()?;
+            (start <= end).then_some((start, end))
+        }).collect::<Option<Vec<_>>>()
     }
 
     fn report_slow_call(&self, started: Option<Instant>, operation: &str, name: &CStr) {
@@ -589,6 +707,7 @@ impl Player {
     }
 
     pub fn property_double(&self, name: &CStr) -> Option<f64> {
+        if let Some(state) = self.observed.borrow().as_ref() { return state.double(name.to_str().ok()?); }
         let mut value = 0.0f64;
         let started = self.profile_calls.get().then(Instant::now);
         let status = unsafe { (self.api.get_property)(self.handle, name.as_ptr(), 5, (&mut value as *mut f64).cast()) };
@@ -597,6 +716,7 @@ impl Player {
     }
 
     pub fn property_flag(&self, name: &CStr) -> Option<bool> {
+        if let Some(state) = self.observed.borrow().as_ref() { return state.flag(name.to_str().ok()?); }
         let mut value: c_int = 0;
         let started = self.profile_calls.get().then(Instant::now);
         let status = unsafe { (self.api.get_property)(self.handle, name.as_ptr(), 3, (&mut value as *mut c_int).cast()) };

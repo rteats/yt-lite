@@ -515,6 +515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seek_benchmark_mode = None;
     let mut seek_fixture_audio: Option<PathBuf> = None;
     let mut seek_cache_expanded = false;
+    let mut observed_state = false;
     let mut persistent_extraction = false;
     let mut worker_python = PathBuf::from("python");
     let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
@@ -526,6 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--fast-extraction" => fast_extraction = true,
             "--preattach-audio" => preattach_audio = true,
             "--seek-cache-expanded" => seek_cache_expanded = true,
+            "--observed-state" => observed_state = true,
             "--seek-fixture-audio" => {
                 let path = PathBuf::from(args.next().ok_or("Missing --seek-fixture-audio PATH")?).canonicalize()?;
                 if !path.is_file() { return Err("Audio fixture must be a local file".into()); }
@@ -691,6 +693,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clip_source = Rc::new(RefCell::new(clip));
     let player = Rc::new(RefCell::new(if seek_cache_expanded { Player::open_with_cache(true)? } else { Player::open()? }));
     if profile_timings { player.borrow().enable_diagnostics(); }
+    if observed_state { player.borrow().enable_observed_state(); }
 
     let seek_started = Rc::new(RefCell::new(None::<(u64, Instant)>));
 
@@ -838,9 +841,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut previous_wait_state = None;
     let mut last_tick = Instant::now();
     let mut seek_benchmark = seek_benchmark_mode.map(seek_benchmark::SeekBenchmark::new);
+    struct TickDuration(Option<Instant>);
+    impl Drop for TickDuration {
+        fn drop(&mut self) {
+            if let Some(started) = self.0 {
+                let us = started.elapsed().as_micros();
+                if us >= 20_000 { trace_event("ui_tick_slow", format_args!("elapsed_us={us}")); }
+            }
+        }
+    }
     let clock = Timer::default();
     let tick_ms = if seek_benchmark.is_some() { 50 } else { 250 };
     clock.start(TimerMode::Repeated, Duration::from_millis(tick_ms), move || {
+        let _tick_duration = TickDuration(profile_timings.then(Instant::now));
         let now = Instant::now();
         if profile_timings && now.duration_since(last_tick) > Duration::from_millis(500) {
             trace_event("ui_timer_gap", format_args!("gap_ms={}", now.duration_since(last_tick).as_millis()));
@@ -1456,10 +1469,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let player = label_player.borrow();
-            let elapsed = player.property_double(c"time-pos").unwrap_or(0.0);
-            let duration = player.property_double(c"duration").unwrap_or(0.0);
+            let position = player.property_double(c"time-pos");
+            let length = player.property_double(c"duration");
+            let elapsed = position.unwrap_or(0.0);
+            let duration = length.unwrap_or(0.0);
             let fraction = if duration > 0.0 { (elapsed / duration).clamp(0.0, 1.0) } else { 0.0 };
-            ui.set_fraction(fraction as f32);
+            if !observed_state || (position.is_some() && length.is_some()) { ui.set_fraction(fraction as f32); }
             let title = media_title.as_deref().unwrap_or("Local video");
             let buffering = file_loaded && player.property_flag(c"paused-for-cache").unwrap_or(false);
             // Inspect clock/decoder/output state at most once per second,
@@ -1475,8 +1490,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let eof = player.property_flag(c"eof-reached").unwrap_or(false);
                 let near_end = duration > 0.0 && duration - elapsed < 3.0;
                 let old_warning = audio_warning;
-                audio_warning = audio_monitor.sample(Some(elapsed), audio_pts,
-                    !paused && !seeking && !buffering && !muted && !eof && !near_end);
+                let flags_known = !observed_state || [c"pause", c"seeking", c"paused-for-cache", c"mute", c"eof-reached"]
+                    .iter().all(|name| player.property_flag(name).is_some());
+                audio_warning = audio_monitor.sample(position, audio_pts,
+                    flags_known && !paused && !seeking && !buffering && !muted && !eof && !near_end);
                 if old_warning != audio_warning {
                     eprintln!("[yt-lite] audio clock {} at {:.1}s", if audio_warning { "stalled" } else { "warning cleared" }, elapsed);
                     ui.set_can_retry(audio_warning && remote_url.is_some());
@@ -1487,8 +1504,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let prefix = if buffering { "Buffering | " } else if audio_warning { "Audio clock stalled — Retry | " } else { "" };
-            ui.set_status(format!("{prefix}{title}  |  {} / {}", time_label(elapsed), time_label(duration)).into());
-            ui.set_paused(player.property_flag(c"pause").unwrap_or(false));
+            if !observed_state || (position.is_some() && length.is_some()) {
+                ui.set_status(format!("{prefix}{title}  |  {} / {}", time_label(elapsed), time_label(duration)).into());
+            }
+            if let Some(paused) = player.property_flag(c"pause") { ui.set_paused(paused); }
+            else if !observed_state { ui.set_paused(false); }
         }
     });
 

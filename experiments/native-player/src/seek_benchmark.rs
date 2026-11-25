@@ -109,7 +109,8 @@ impl SeekBenchmark {
         if ready_since.elapsed() < SETTLE { return; }
         let duration = match self.duration.or_else(|| player.property_double(c"duration")) {
             Some(d) if d >= 60.0 => d,
-            _ => { self.abort("requires_video_at_least_60_seconds"); return; }
+            Some(_) => { self.abort("requires_video_at_least_60_seconds"); return; }
+            None => return, // An observed duration may not have arrived yet.
         };
         self.duration = Some(duration);
         let target = (duration * TARGETS[self.next] * 1000.0).round() / 1000.0;

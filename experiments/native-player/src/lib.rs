@@ -335,3 +335,5 @@ pub fn diagnostic_stream_hint(text: &str) -> &'static str {
         _ => "unknown",
     }
 }
+
+pub mod observed_state;
