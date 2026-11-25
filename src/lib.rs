@@ -1,10 +1,84 @@
 //! Feasibility harness for the yt-lite extraction adapter seam (issue #3).
 //! No stream URLs, cookies or provider stderr are included in error messages.
 
+pub mod persistent;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::Path, time::Duration};
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, time::timeout, io::{AsyncBufReadExt, AsyncReadExt, BufReader}};
+use std::{process::Stdio, sync::{OnceLock, atomic::{AtomicU64, Ordering}}, time::Instant};
+
+static TRACE_START: OnceLock<Instant> = OnceLock::new();
+static TRACE_NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Monotonic process clock shared by the extraction and native player.
+pub fn trace_event(event: &str, details: std::fmt::Arguments<'_>) {
+    let elapsed = TRACE_START.get_or_init(Instant::now).elapsed().as_millis();
+    eprintln!("[yt-lite] trace t_ms={elapsed} event={event} {details}");
+}
+
+pub fn trace_id() -> u64 { TRACE_NEXT.fetch_add(1, Ordering::Relaxed) }
+
+/// Return only fixed categories, never any part of a provider log line.
+pub fn extraction_marker(line: &str) -> Option<&'static str> {
+    let s = line.to_ascii_lowercase();
+    if s.contains("retrying") { return Some("retry"); }
+    if s.contains("timed out") || s.contains("timeout") && s.starts_with("warning:") { return Some("timeout_warning"); }
+    if s.starts_with("warning:") { return Some("warning"); }
+    if s.starts_with("error:") { return Some("error"); }
+    if s.contains("running quickjs:") || s.contains("running deno:") ||
+        s.contains("running node:") || s.contains("running bun:") { return Some("runtime_launch"); }
+    if s.contains("solving js challenges") { return Some("js_solve_announced"); }
+    if s.contains("downloading") && s.contains("player api json") { return Some("player_api"); }
+    if s.contains("downloading") && (s.contains("m3u8") || s.contains("mpd") || s.contains("manifest")) { return Some("manifest"); }
+    if s.contains("downloading") && (s.contains("player ") || s.contains("player javascript")) { return Some("player_code"); }
+    if s.contains("downloading webpage") { return Some("webpage"); }
+    if s.contains("downloading") && s.contains("initial data") { return Some("initial_data"); }
+    if s.contains("downloading") && s.contains("client config") { return Some("client_config"); }
+    if s.contains("loading") && s.contains("cache") && s.contains("[debug]") { return Some("cache_lookup"); }
+    if s.contains("[jsc:") { return Some("js_marker"); }
+    if s.starts_with("[debug] loaded ") { return Some("extractors_ready"); }
+    if s.starts_with("[debug]") { return Some("debug"); }
+    None
+}
+
+async fn traced_helper(cmd: &mut Command, id: u64) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    let started = Instant::now();
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    trace_event("extract_spawned", format_args!("id={id} elapsed_ms={}", started.elapsed().as_millis()));
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let read_stdout = async {
+        let mut data = Vec::new();
+        let mut first = [0u8; 8192];
+        let n = stdout.read(&mut first).await?;
+        trace_event("extract_stdout_first", format_args!("id={id} elapsed_ms={} bytes={n}", started.elapsed().as_millis()));
+        data.extend_from_slice(&first[..n]);
+        stdout.read_to_end(&mut data).await?;
+        trace_event("extract_stdout_done", format_args!("id={id} elapsed_ms={} bytes={}", started.elapsed().as_millis(), data.len()));
+        Ok::<_, std::io::Error>(data)
+    };
+    let read_stderr = async {
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        let mut seq = 0u64;
+        let mut last = started;
+        while reader.read_until(b'\n', &mut line).await? != 0 {
+            if let Some(kind) = extraction_marker(&String::from_utf8_lossy(&line)) {
+                seq += 1;
+                let now = Instant::now();
+                trace_event("extract_marker", format_args!("id={id} seq={seq} kind={kind} elapsed_ms={} gap_ms={}", started.elapsed().as_millis(), now.duration_since(last).as_millis()));
+                last = now;
+            }
+            line.clear();
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let (status, data, _) = tokio::try_join!(child.wait(), read_stdout, read_stderr)?;
+    trace_event("extract_exit", format_args!("id={id} elapsed_ms={} success={}", started.elapsed().as_millis(), status.success()));
+    Ok((status, data))
+}
 use url::Url;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +123,8 @@ pub struct Stream {
     pub width: Option<u64>,
     pub height: Option<u64>,
     pub fps: Option<f64>,
+    #[serde(default)]
+    pub protocol: Option<String>,
     pub has_video: bool,
     pub has_audio: bool,
     #[serde(default)]
@@ -248,7 +324,7 @@ fn formats(root: &Value) -> Capability<Stream> {
         // must not be advertised as selectable audio/video streams.
         if !has_video && !has_audio { return None; }
         Some(Stream { format_id, url, width: integer(&v["width"]), height: integer(&v["height"]),
-            fps: number(&v["fps"]), has_video, has_audio,
+            fps: number(&v["fps"]), protocol: string(&v["protocol"]), has_video, has_audio,
             http_headers: playback_http_headers(root, v) })
     }).collect::<Vec<_>>();
     if items.is_empty() { Capability::Unavailable } else { Capability::Available(items) }
@@ -348,22 +424,51 @@ async fn yt_dlp_extract(
     id: &str,
     helper: &Path,
     lean_metadata: bool,
+    native_ejs: Option<&Path>,
+    trace: Option<u64>,
+    fast: bool,
 ) -> Result<ExtractionResult, ProbeError> {
     let mut cmd = Command::new(helper);
     cmd.kill_on_drop(true)
-        .args(["--ignore-config", "--no-playlist", "--no-warnings", "--skip-download"])
-        .args(yt_dlp_output_args(lean_metadata))
-        .args(["--socket-timeout", "10", "--", url]);
-    let output = timeout(Duration::from_secs(45), cmd.output()).await
-        .map_err(|_| ProbeError::new("timeout", "yt-dlp exceeded its time limit.", "Retry or choose Rust provider."))?
+        .args(["--ignore-config", "--no-playlist", "--skip-download"])
+        .args(yt_dlp_output_args(lean_metadata));
+    if trace.is_none() { cmd.arg("--no-warnings"); }
+    if let Some(solver) = native_ejs {
+        // Use the upstream EJS compatibility executable as the only enabled
+        // JS runtime for this attempt. No shell, auto-install or plugin loading.
+        let mut runtime = std::ffi::OsString::from("quickjs:");
+        runtime.push(solver.as_os_str());
+        cmd.args(["--no-plugin-dirs", "--no-js-runtimes", "--js-runtimes"]).arg(runtime);
+    }
+    if trace.is_some() { cmd.arg("--verbose"); }
+    if fast {
+        // Experimental playback-only path; the caller owns standard fallback.
+        // The TV player variant is a temporary upstream solver workaround.
+        cmd.args(["--socket-timeout", "2.5", "--extractor-args", "youtube:player_js_variant=tv;skip=hls"]);
+    } else {
+        cmd.args(["--socket-timeout", "10"]);
+    }
+    cmd.args(["--", url]);
+    let run = async {
+        if let Some(id) = trace { traced_helper(&mut cmd, id).await }
+        else { cmd.output().await.map(|output| (output.status, output.stdout)) }
+    };
+    let (status, stdout) = timeout(Duration::from_secs(45), run).await
+        .map_err(|_| {
+            if let Some(id) = trace { trace_event("extract_timeout", format_args!("id={id}")); }
+            ProbeError::new("timeout", "yt-dlp exceeded its time limit.", "Retry or choose Rust provider.")
+        })?
         .map_err(|_| ProbeError::new("helper_missing", "yt-dlp could not be started.", "Supply --yt-dlp PATH to a compatible local helper."))?;
-    if !output.status.success() {
+    if !status.success() {
         return Err(ProbeError::new("yt_dlp_failed", "yt-dlp could not resolve the video.", "Update the helper or open the video in a browser."));
     }
-    let json = std::str::from_utf8(&output.stdout).map_err(|_| ProbeError::new(
+    let parse_start = Instant::now();
+    let json = std::str::from_utf8(&stdout).map_err(|_| ProbeError::new(
         "malformed_response", "yt-dlp returned non-UTF8 output.", "Update yt-dlp and retry."
     ))?;
-    parse_provider_json(Provider::YtDlp, id, json)
+    let result = parse_provider_json(Provider::YtDlp, id, json);
+    if let Some(id) = trace { trace_event("extract_parse_done", format_args!("id={id} elapsed_us={} bytes={} success={}", parse_start.elapsed().as_micros(), stdout.len(), result.is_ok())); }
+    result
 }
 
 /// Full capability extraction used by the public harness. Never silently
@@ -381,13 +486,167 @@ pub async fn extract_playback(
     helper: &Path,
     lean_metadata: bool,
 ) -> Result<ExtractionResult, ProbeError> {
+    extract_playback_with_ejs(url, selected, helper, lean_metadata, None).await
+}
+
+/// Optional externally installed, native SWC/QuickJS solver experiment.
+/// The normal public extraction API and its default runtime are unchanged.
+/// One attempt only: the playback caller is responsible for retry policy.
+pub async fn extract_playback_with_ejs(
+    url: &str,
+    selected: Provider,
+    helper: &Path,
+    lean_metadata: bool,
+    native_ejs: Option<&Path>,
+) -> Result<ExtractionResult, ProbeError> {
+    extract_playback_traced(url, selected, helper, lean_metadata, native_ejs, None).await
+}
+
+pub async fn extract_playback_traced(
+    url: &str, selected: Provider, helper: &Path, lean_metadata: bool,
+    native_ejs: Option<&Path>, trace: Option<u64>,
+) -> Result<ExtractionResult, ProbeError> {
+    extract_playback_attempt(url, selected, helper, lean_metadata, native_ejs, trace, false).await
+}
+
+/// Single playback extraction attempt. Fast mode is opt-in and callers must
+/// retry standard extraction if the result cannot actually be played.
+pub async fn extract_playback_attempt(
+    url: &str, selected: Provider, helper: &Path, lean_metadata: bool,
+    native_ejs: Option<&Path>, trace: Option<u64>, fast: bool,
+) -> Result<ExtractionResult, ProbeError> {
     let (id, canonical) = canonical_video_url(url)?;
-    match selected {
+    if let Some(trace_id) = trace { trace_event("extract_begin", format_args!("id={trace_id} video={id} provider={selected:?} native_ejs={} fast={fast}", native_ejs.is_some())); }
+    let started = Instant::now();
+    let result = match selected {
         Provider::Rust => rust_extract(&canonical, &id).await,
-        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata).await,
+        Provider::YtDlp => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace, fast).await,
         Provider::Auto => match rust_extract(&canonical, &id).await {
             Ok(result) if matches!(&result.streams, Capability::Available(_)) => Ok(result),
-            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata).await,
+            _ => yt_dlp_extract(&canonical, &id, helper, lean_metadata, native_ejs, trace, fast).await,
         },
+    };
+    if let Some(id) = trace { trace_event("extract_end", format_args!("id={id} elapsed_ms={} success={}", started.elapsed().as_millis(), result.is_ok())); }
+    result
+}
+
+/// Search initially loads eight results. Each additional request retrieves
+/// a larger prefix because yt-dlp's ytsearchN accepts a count, not a cursor.
+pub const SEARCH_BATCH_SIZE: usize = 8;
+pub const SEARCH_MAX_RESULTS: usize = 40;
+
+/// Read-only video search result. The public watch URL is constructed from
+/// video_id later; this type cannot expose signed media URLs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub video_id: String,
+    pub title: String,
+    pub channel: Option<String>,
+    pub duration_seconds: Option<u64>,
+}
+
+/// A single search prefix, including whether yt-dlp returned the full
+/// requested batch before invalid/non-video items were filtered out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub has_more: bool,
+}
+
+/// Validate a search before launching any helper or performing network IO.
+pub fn validated_search_query(input: &str) -> Result<String, ProbeError> {
+    let query = input.trim();
+    if query.is_empty() || query.chars().count() > 120 || query.chars().any(char::is_control) {
+        return Err(ProbeError::new(
+            "invalid_search", "Search must be 1–120 characters on one line.",
+            "Enter a short video search phrase.",
+        ));
     }
+    Ok(query.to_owned())
+}
+
+/// Validate a bounded ytsearchN target. The query remains one command
+/// argument and is never interpolated into a shell command.
+pub fn search_target(query: &str, count: usize) -> Result<String, ProbeError> {
+    let query = validated_search_query(query)?;
+    if count == 0 || count > SEARCH_MAX_RESULTS {
+        return Err(ProbeError::new("invalid_search_size",
+            "Search size must be between 1 and 40.",
+            "Use Load more to request the next batch."));
+    }
+    Ok(format!("ytsearch{count}:{query}"))
+}
+
+/// Parse yt-dlp's flat playlist search response; skip non-video entries and
+/// malformed IDs rather than allowing an arbitrary URL into playback.
+pub fn parse_search_json(json: &str) -> Result<Vec<SearchHit>, ProbeError> {
+    let root: Value = serde_json::from_str(json).map_err(|_| ProbeError::new(
+        "search_malformed", "Search provider returned malformed data.", "Retry the search or update yt-dlp."
+    ))?;
+    let entries = root.get("entries").and_then(Value::as_array).ok_or_else(|| ProbeError::new(
+        "search_malformed", "Search results could not be read.", "Retry the search or update yt-dlp."
+    ))?;
+    Ok(entries.iter().filter_map(|item| {
+        if item.get("_type").and_then(Value::as_str) == Some("playlist") { return None; }
+        let id = string(&item["id"])?;
+        if id.len() != 11 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return None;
+        }
+        let title = string(&item["title"])?;
+        Some(SearchHit {
+            video_id: id,
+            title,
+            channel: string(at(item, &["channel", "uploader"])),
+            duration_seconds: integer(&item["duration"]),
+        })
+    }).take(SEARCH_MAX_RESULTS).collect())
+}
+
+/// Parse a search prefix and record its raw entry count, so a filtered
+/// playlist/invalid item does not incorrectly hide pagination controls.
+pub fn parse_search_page(json: &str, requested: usize) -> Result<SearchPage, ProbeError> {
+    if requested == 0 || requested > SEARCH_MAX_RESULTS {
+        return Err(ProbeError::new("invalid_search_size",
+            "Search size must be between 1 and 40.", "Use Load more for additional results."));
+    }
+    let root: Value = serde_json::from_str(json).map_err(|_| ProbeError::new(
+        "search_malformed", "Search provider returned malformed data.",
+        "Retry the search or update yt-dlp."))?;
+    let raw_count = root.get("entries").and_then(Value::as_array)
+        .ok_or_else(|| ProbeError::new(
+            "search_malformed", "Search results could not be read.",
+            "Retry the search or update yt-dlp."))?.len();
+    Ok(SearchPage {
+        hits: parse_search_json(json)?,
+        has_more: raw_count >= requested && requested < SEARCH_MAX_RESULTS,
+    })
+}
+
+/// Search via the existing on-device yt-dlp helper without extra proxy
+/// services, authentication, downloads, or per-result video extraction.
+/// The flat result's metadata is intentionally best-effort.
+pub async fn search_youtube(query: &str, helper: &Path) -> Result<Vec<SearchHit>, ProbeError> {
+    Ok(search_youtube_with_limit(query, helper, SEARCH_BATCH_SIZE).await?.hits)
+}
+
+/// Return the first N public search hits. Newer batches repeat earlier hits
+/// because yt-dlp's ytsearchN does not expose a stable pagination cursor.
+pub async fn search_youtube_with_limit(query: &str, helper: &Path, count: usize) -> Result<SearchPage, ProbeError> {
+    let target = search_target(query, count)?;
+    let mut cmd = Command::new(helper);
+    cmd.kill_on_drop(true).args([
+        "--ignore-config", "--no-warnings", "--flat-playlist",
+        "--yes-playlist", "--skip-download", "--dump-single-json",
+        "--socket-timeout", "10", "--",
+    ]).arg(&target);
+    let output = timeout(Duration::from_secs(40), cmd.output()).await
+        .map_err(|_| ProbeError::new("search_timeout", "Search timed out.", "Retry with a shorter query."))?
+        .map_err(|_| ProbeError::new("helper_missing", "Search helper could not start.", "Install or configure local yt-dlp."))?;
+    if !output.status.success() {
+        return Err(ProbeError::new("search_failed", "YouTube search failed.", "Retry or update the local yt-dlp helper."));
+    }
+    let json = std::str::from_utf8(&output.stdout).map_err(|_| ProbeError::new(
+        "search_malformed", "Search helper returned invalid text.", "Update yt-dlp and retry."
+    ))?;
+    parse_search_page(json, count)
 }

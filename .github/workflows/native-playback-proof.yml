@@ -45,5 +45,7 @@ jobs:
       - name: Profile script offline self-test (Windows PowerShell 5.1)
         shell: powershell
         run: .\\experiments\\native-player\\profile-yt-dlp.ps1 -SelfTest
+      - name: Request profiler offline self-test
+        run: python experiments/native-player/profile-extractor.py --self-test
       - run: cargo check --manifest-path experiments/native-player/Cargo.toml --all-targets
       - run: cargo test --manifest-path experiments/native-player/Cargo.toml --all-targets

@@ -5,14 +5,17 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
-use yt_lite_native_player_proof::NETWORK_STREAM_OPTIONS;
+use yt_lite_native_player_proof::observed_state::{ObservedState, ObservedValue};
+use yt_lite_native_player_proof::{diagnostic_stream_hint, preattached_audio_command, search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
 use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
 use std::{
+    cell::{Cell, RefCell},
     ffi::{c_char, c_int, c_void, CStr, CString},
     path::Path,
     ptr,
+    time::Instant,
     sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
 };
 
@@ -38,6 +41,63 @@ struct OpenGlFbo {
 
 type RenderUpdate = Option<unsafe extern "C" fn(*mut c_void)>;
 
+// Public client.h ABI for reading the seekable-ranges node. Only numerical
+// fields are copied; no strings, media filenames or URLs leave the bridge.
+#[repr(C)]
+union MpvNodeValue {
+    double: f64,
+    int64: i64,
+    list: *mut MpvNodeList,
+}
+
+#[repr(C)]
+struct MpvNode {
+    value: MpvNodeValue,
+    format: c_int,
+}
+
+#[repr(C)]
+struct MpvNodeList {
+    num: c_int,
+    values: *mut MpvNode,
+    keys: *mut *mut c_char,
+}
+
+impl MpvNode {
+    // SAFETY: only called on a live mpv-owned node before free_node_contents.
+    unsafe fn entries(&self, format: c_int) -> Option<(&MpvNodeList, &[MpvNode])> {
+        if self.format != format { return None; }
+        let list = self.value.list.as_ref()?;
+        if !(0..=4096).contains(&list.num) { return None; }
+        let values = if list.num == 0 {
+            &[]
+        } else {
+            if list.values.is_null() { return None; }
+            std::slice::from_raw_parts(list.values, list.num as usize)
+        };
+        Some((list, values))
+    }
+
+    unsafe fn field(&self, name: &[u8]) -> Option<&MpvNode> {
+        let (list, values) = self.entries(8)?; // MPV_FORMAT_NODE_MAP
+        if list.keys.is_null() { return None; }
+        for (i, value) in values.iter().enumerate() {
+            let key = *list.keys.add(i);
+            if !key.is_null() && CStr::from_ptr(key).to_bytes() == name {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    unsafe fn finite_double(&self) -> Option<f64> {
+        if self.format != 5 { return None; } // MPV_FORMAT_DOUBLE
+        let n = self.value.double;
+        n.is_finite().then_some(n)
+    }
+}
+
+
 #[repr(C)]
 struct MpvEvent {
     event_id: c_int,
@@ -58,19 +118,86 @@ pub enum PlaybackEvent {
     FileLoaded,
     PlaybackRestart,
     LoadFailed(i32),
+    ExternalAudioAdded,
+    ExternalAudioFailed(i32),
+    SeekAudioReloadReply(i32),
     Ended,
+    Seek,
+    AudioReconfig,
+    VideoReconfig,
+    Diagnostic(&'static str),
 }
 
 // mpv/client.h: START_FILE=6, END_FILE=7, FILE_LOADED=8,
 // COMMAND_REPLY=5; MPV_END_FILE_REASON_ERROR=4.
 const MPV_EVENT_NONE: c_int = 0;
+const MPV_EVENT_LOG_MESSAGE: c_int = 2;
+const MPV_EVENT_GET_PROPERTY_REPLY: c_int = 3;
+const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
+const MPV_EVENT_AUDIO_RECONFIG: c_int = 18;
+const MPV_EVENT_SEEK: c_int = 20;
+const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+const MPV_EVENT_QUEUE_OVERFLOW: c_int = 24;
+const MPV_FORMAT_NONE: c_int = 0;
+const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_DOUBLE: c_int = 5;
+const MPV_FORMAT_NODE: c_int = 6;
+
+#[repr(C)]
+struct MpvEventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
+const OBSERVED_PROPERTIES: &[(&str, &CStr, c_int)] = &[
+    ("time-pos", c"time-pos", MPV_FORMAT_DOUBLE),
+    ("duration", c"duration", MPV_FORMAT_DOUBLE),
+    ("audio-pts", c"audio-pts", MPV_FORMAT_DOUBLE),
+    ("pause", c"pause", MPV_FORMAT_FLAG),
+    ("seeking", c"seeking", MPV_FORMAT_FLAG),
+    ("paused-for-cache", c"paused-for-cache", MPV_FORMAT_FLAG),
+    ("demuxer-cache-duration", c"demuxer-cache-duration", MPV_FORMAT_DOUBLE),
+    ("cache-buffering-state", c"cache-buffering-state", MPV_FORMAT_DOUBLE),
+    ("cache-speed", c"cache-speed", MPV_FORMAT_DOUBLE),
+    ("avsync", c"avsync", MPV_FORMAT_DOUBLE),
+    ("audio-params/samplerate", c"audio-params/samplerate", MPV_FORMAT_DOUBLE),
+    ("audio-out-params/samplerate", c"audio-out-params/samplerate", MPV_FORMAT_DOUBLE),
+    ("mute", c"mute", MPV_FORMAT_FLAG),
+    ("eof-reached", c"eof-reached", MPV_FORMAT_FLAG),
+    ("demuxer-cache-state", c"demuxer-cache-state", MPV_FORMAT_NODE),
+];
+
+#[repr(C)]
+struct MpvLogMessage {
+    prefix: *const c_char,
+    level: *const c_char,
+    text: *const c_char,
+    log_level: c_int,
+}
+
+// Classify only; do not print any raw message (may contain signed URLs).
+fn safe_mpv_log(text: &str) -> Option<&'static str> {
+    if let Some(kind) = yt_lite_native_player_proof::transport_recovery::transport_diagnostic(text) { return Some(kind); }
+    let s = text.to_ascii_lowercase();
+    if s.contains("timed out") || s.contains("timeout") { Some("network_timeout") }
+    else if s.contains("http error") || s.contains("http response") { Some("http_error_or_response") }
+    else if s.contains("reconnect") { Some("reconnect") }
+    else if s.contains("end of file") || s.contains("eof") { Some("eof_marker") }
+    else if s.contains("seek") && (s.contains("fail") || s.contains("error")) { Some("seek_error") }
+    else if s.contains("seek") { Some("seek_marker") }
+    else if s.contains("audio") && (s.contains("fail") || s.contains("error")) { Some("audio_error") }
+    else if s.contains("buffer") || s.contains("cache") { Some("cache_marker") }
+    else if s.contains("error") || s.contains("failed") { Some("other_error") }
+    else { None }
+}
 const MPV_EVENT_COMMAND_REPLY: c_int = 5;
 const MPV_EVENT_START_FILE: c_int = 6;
 const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
-const LOADFILE_REPLY_ID: u64 = 0x594c_4f41_44;
+const FIRST_REPLY_ID: u64 = 1;
 
 #[derive(Clone, Copy)]
 struct Api {
@@ -81,12 +208,17 @@ struct Api {
     set_property_string: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     command_async: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
+    get_property_async: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
+    free_node_contents: unsafe extern "C" fn(*mut MpvNode),
+    observe_property: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
+    unobserve_property: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
     render_create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const RenderParam) -> c_int,
     render_free: unsafe extern "C" fn(*mut c_void),
     render_render: unsafe extern "C" fn(*mut c_void, *const RenderParam) -> c_int,
     render_update: unsafe extern "C" fn(*mut c_void) -> u64,
     render_callback: unsafe extern "C" fn(*mut c_void, RenderUpdate, *mut c_void),
     wait_event: unsafe extern "C" fn(*mut c_void, f64) -> *const MpvEvent,
+    request_log_messages: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
 }
 
 impl Api {
@@ -102,12 +234,17 @@ impl Api {
             set_property_string: get(library, b"mpv_set_property_string\0")?,
             command_async: get(library, b"mpv_command_async\0")?,
             get_property: get(library, b"mpv_get_property\0")?,
+            get_property_async: get(library, b"mpv_get_property_async\0")?,
+            free_node_contents: get(library, b"mpv_free_node_contents\0")?,
+            observe_property: get(library, b"mpv_observe_property\0")?,
+            unobserve_property: get(library, b"mpv_unobserve_property\0")?,
             render_create: get(library, b"mpv_render_context_create\0")?,
             render_free: get(library, b"mpv_render_context_free\0")?,
             render_render: get(library, b"mpv_render_context_render\0")?,
             render_update: get(library, b"mpv_render_context_update\0")?,
             render_callback: get(library, b"mpv_render_context_set_update_callback\0")?,
             wait_event: get(library, b"mpv_wait_event\0")?,
+            request_log_messages: get(library, b"mpv_request_log_messages\0")?,
         })
     }
 }
@@ -157,17 +294,41 @@ unsafe extern "C" fn gl_proc(_ctx: *mut c_void, name: *const c_char) -> *mut c_v
     if module.is_null() { ptr::null_mut() } else { GetProcAddress(module, name) }
 }
 
+struct SeekProbe {
+    reply: u64,
+    sample: usize,
+    phase: &'static str,
+    name: &'static CStr,
+    format: c_int,
+    observed_at_request: Option<f64>,
+    started: Instant,
+}
+
 pub struct Player {
     api: Api,
     handle: *mut c_void,
     context: *mut c_void,
     wake: Option<Box<Wake>>,
     loaded: bool,
+    profile_calls: Cell<bool>,
+    observed: RefCell<Option<ObservedState>>,
+    observed_file_loaded: Cell<bool>,
+    next_reply: Cell<u64>,
+    pending_load_reply: Cell<Option<u64>>,
+    pending_audio_reply: Cell<Option<u64>>,
+    seek_probes: RefCell<Vec<SeekProbe>>,
+    seek_audio_reload_reply: Cell<Option<u64>>,
+    seek_missing_confirmation: Cell<Option<(usize, Instant)>>,
+    expected_preattached_audio: RefCell<Option<String>>,
+    audio_cache: RefCell<Option<yt_lite_native_player_proof::audio_cache::AudioCache>>,
+    last_video_margins: Option<(u64, u64, u64)>,
     _lib: Library,
 }
 
 impl Player {
-    pub fn open() -> Result<Self, String> {
+    pub fn open() -> Result<Self, String> { Self::open_with_cache(false) }
+
+    pub fn open_with_cache(expanded: bool) -> Result<Self, String> {
         // Accept both names used by Windows libmpv builds, without searching PATH.
         let executable = std::env::current_exe().map_err(|err| err.to_string())?;
         let directory = executable.parent().ok_or("Missing executable directory")?;
@@ -185,7 +346,26 @@ impl Player {
         let api = unsafe { Api::load(&lib)? };
         let handle = unsafe { (api.create)() };
         if handle.is_null() { return Err("mpv_create failed".into()); }
-        let player = Self { api, handle, context: ptr::null_mut(), wake: None, loaded: false, _lib: lib };
+        let player = Self {
+            api,
+            handle,
+            context: ptr::null_mut(),
+            wake: None,
+            loaded: false,
+            profile_calls: Cell::new(false),
+            observed: RefCell::new(None),
+            observed_file_loaded: Cell::new(false),
+            next_reply: Cell::new(FIRST_REPLY_ID),
+            pending_load_reply: Cell::new(None),
+            pending_audio_reply: Cell::new(None),
+            seek_probes: RefCell::new(Vec::new()),
+            seek_audio_reload_reply: Cell::new(None),
+            seek_missing_confirmation: Cell::new(None),
+            expected_preattached_audio: RefCell::new(None),
+            audio_cache: RefCell::new(None),
+            last_video_margins: None,
+            _lib: lib,
+        };
         // Network HTTP media is streamed through libmpv with bounded memory,
         // no disk cache, and no full-file download before playback.
         for (key, value) in [
@@ -196,6 +376,12 @@ impl Player {
             ("osc", "no"),
             ("hwdec", "auto-safe"),
         ].into_iter().chain(NETWORK_STREAM_OPTIONS.iter().copied()) {
+            // Isolate retained cache capacity; do not change forward time target.
+            let value = if expanded { match key {
+                "demuxer-max-bytes" => "64MiB",
+                "demuxer-max-back-bytes" => "32MiB",
+                _ => value,
+            } } else { value };
             let key = CString::new(key).unwrap();
             let value = CString::new(value).unwrap();
             let status = unsafe { (player.api.set_option_string)(player.handle, key.as_ptr(), value.as_ptr()) };
@@ -230,6 +416,17 @@ impl Player {
         Ok(())
     }
 
+    /// Diagnostic-only local split fixture, same mpv per-file audio option.
+    pub fn load_local_split(&mut self, video: &Path, audio: &Path) -> Result<(), String> {
+        if !self.is_render_ready() { return Err("render context not ready".into()); }
+        let video = video.to_str().ok_or("fixture path is not UTF-8")?;
+        let audio = audio.to_str().ok_or("fixture path is not UTF-8")?;
+        self.send_load_command(&["loadfile".into(), video.into(), "replace".into(), "-1".into(),
+            format!("audio-files-append=%{}%{}", audio.len(), audio)])?;
+        self.loaded = true;
+        Ok(())
+    }
+
     pub fn is_render_ready(&self) -> bool {
         !self.context.is_null()
     }
@@ -239,6 +436,35 @@ impl Player {
         url: &str,
         headers: &HttpPlaybackHeaders,
     ) -> Result<(), String> {
+        self.load_network_media(url, None, headers)
+    }
+
+    /// Experimental: ask mpv to attach the audio during the initial load.
+    /// Per-file options are restored by mpv when the file is replaced.
+    pub fn load_network_with_audio(&mut self, url: &str, audio: &str, headers: &HttpPlaybackHeaders) -> Result<(), String> {
+        self.load_network_media(url, Some(audio), headers)
+    }
+
+    /// Start speculative audio prefetch before video dispatch. If eligibility,
+    /// binding, randomness or worker startup fails, keep the original URL.
+    pub fn load_network_with_cached_audio(&mut self, video: &str, audio: &str, headers: &HttpPlaybackHeaders, id: u64) -> Result<(), String> {
+        self.audio_cache.borrow_mut().take();
+        let cache = yt_lite_native_player_proof::audio_cache::AudioCache::start(audio, headers, id);
+        let target = cache.as_ref().map(|c| c.url()).unwrap_or(audio);
+        self.load_network_media(video, Some(target), headers)?;
+        *self.audio_cache.borrow_mut() = cache;
+        Ok(())
+    }
+
+    pub fn load_loopback_edl(&mut self, port: u16) -> Result<(), String> {
+        if !self.is_render_ready() { return Err("libmpv render context is not ready yet".into()); }
+        let source = yt_lite_native_player_proof::loopback_edl_source(port).ok_or("Invalid fixture port")?;
+        self.send_loadfile(&source)?;
+        self.loaded = true;
+        Ok(())
+    }
+
+    fn load_network_media(&mut self, url: &str, audio: Option<&str>, headers: &HttpPlaybackHeaders) -> Result<(), String> {
         if !self.is_render_ready() {
             return Err("libmpv render context is not ready yet".into());
         }
@@ -253,7 +479,13 @@ impl Player {
         if let Some(ref referer) = headers.referer {
             self.set_string_property(c"referrer", referer)?;
         }
-        self.send_loadfile(url)?;
+        if let Some(audio) = audio {
+            let args = preattached_audio_command(url, audio).ok_or("Invalid split HTTP media URL")?;
+            self.send_load_command(&args)?;
+            *self.expected_preattached_audio.borrow_mut() = Some(audio.to_owned());
+        } else {
+            self.send_loadfile(url)?;
+        }
         self.loaded = true;
         Ok(())
     }
@@ -261,10 +493,58 @@ impl Player {
     fn set_string_property(&self, name: &CStr, value: &str) -> Result<(), String> {
         let cvalue = CString::new(value)
             .map_err(|_| "Extractor returned an invalid HTTP header".to_string())?;
+        let started = self.profile_calls.get().then(Instant::now);
         let rc = unsafe { (self.api.set_property_string)(self.handle, name.as_ptr(), cvalue.as_ptr()) };
+        self.report_slow_call(started, "set_property", name);
         if rc < 0 {
             return Err(format!("mpv rejected HTTP request setting (code {rc})"));
         }
+        Ok(())
+    }
+
+    /// Add a separate HTTP audio track after the video FILE_LOADED event.
+    /// The two network streams share compatible User-Agent / Referer headers.
+    /// This remains one mpv decoder session; no local download or muxing.
+    pub fn add_external_audio(&self, url: &str) -> Result<(), String> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err("Extractor returned a non-HTTP audio stream".into());
+        }
+        let reply = self.allocate_reply();
+        self.send_command(&["audio-add".into(), url.into(), "select".into()], reply)?;
+        self.pending_audio_reply.set(Some(reply));
+        Ok(())
+    }
+
+    /// Reopen selected external audio. Separate reply ID from startup audio-add.
+    pub fn reload_seek_audio(&self) -> Result<(), String> {
+        let reply = self.allocate_reply();
+        self.send_command(&["audio-reload".into()], reply)?;
+        self.seek_audio_reload_reply.set(Some(reply));
+        self.seek_missing_confirmation.set(None);
+        Ok(())
+    }
+
+    pub fn take_seek_missing_confirmation(&self, sample: usize) -> bool {
+        self.seek_missing_confirmation.take().is_some_and(|(index, at)| index == sample && at.elapsed() <= std::time::Duration::from_millis(500))
+    }
+
+    /// mpv renders to the full GL framebuffer; reserve Slint chrome as
+    /// margins so the *video picture* is confined to the visible center.
+    /// Avoid setting properties on every frame; update only on geometry/DPI
+    /// or when the video metadata row changes.
+    pub fn update_video_margins(
+        &mut self, width_px: u32, height_px: u32, scale_factor: f32,
+        has_metadata: bool, show_search: bool,
+    ) -> Result<(), String> {
+        if width_px == 0 || height_px == 0 { return Ok(()); }
+        let (top, bottom) = video_margin_ratios(height_px, scale_factor, has_metadata);
+        let right = search_margin_ratio(width_px, scale_factor, show_search);
+        let key = (top.to_bits(), bottom.to_bits(), right.to_bits());
+        if self.last_video_margins == Some(key) { return Ok(()); }
+        self.set_string_property(c"video-margin-ratio-top", &format!("{top:.7}"))?;
+        self.set_string_property(c"video-margin-ratio-bottom", &format!("{bottom:.7}"))?;
+        self.set_string_property(c"video-margin-ratio-right", &format!("{right:.7}"))?;
+        self.last_video_margins = Some(key);
         Ok(())
     }
 
@@ -273,7 +553,20 @@ impl Player {
     }
 
     fn send_loadfile(&self, target: &str) -> Result<(), String> {
-        self.send_command(&["loadfile".into(), target.into(), "replace".into()], LOADFILE_REPLY_ID)
+        self.send_load_command(&["loadfile".into(), target.into(), "replace".into()])
+    }
+
+    fn allocate_reply(&self) -> u64 {
+        let id = self.next_reply.get();
+        self.next_reply.set(id.wrapping_add(1).max(FIRST_REPLY_ID));
+        id
+    }
+
+    fn send_load_command(&self, args: &[String]) -> Result<(), String> {
+        let reply = self.allocate_reply();
+        self.send_command(args, reply)?;
+        self.pending_load_reply.set(Some(reply));
+        Ok(())
     }
 
     fn send_command(&self, args: &[String], reply: u64) -> Result<(), String> {
@@ -282,27 +575,113 @@ impl Player {
         let mut pointers: Vec<*const c_char> = strings.iter().map(|s| s.as_ptr()).collect();
         pointers.push(ptr::null());
         let status = unsafe { (self.api.command_async)(self.handle, reply, pointers.as_ptr()) };
-        if status < 0 { Err(format!("mpv_command_async rejected command: {status}")) } else { Ok(()) }
+        if status < 0 {
+            return Err(format!("mpv_command_async rejected command: {status}"));
+        }
+        // An audio-add reply can arrive after the playing file is replaced.
+        if matches!(args.first().map(String::as_str), Some("stop" | "loadfile")) {
+            self.pending_audio_reply.set(None);
+            self.pending_load_reply.set(None);
+            self.seek_probes.borrow_mut().clear();
+            self.seek_audio_reload_reply.set(None);
+            self.seek_missing_confirmation.set(None);
+            self.expected_preattached_audio.borrow_mut().take();
+            self.audio_cache.borrow_mut().take();
+            self.observed_file_loaded.set(false);
+            self.reset_observations(false);
+        }
+        Ok(())
     }
 
     /// Nonblocking mpv event processing. Never include event payload filenames
     /// or streaming URLs in diagnostics; only expose numeric error codes.
     pub fn poll_events(&self) -> Vec<PlaybackEvent> {
+        let started = self.profile_calls.get().then(Instant::now);
         let mut events = Vec::new();
-        for _ in 0..64 {
+        // Property events are coalesced behind queued lifecycle/log events.
+        // Bound work while allowing the observed mode to drain a larger burst.
+        let budget = if self.observed.borrow().is_some() { 256 } else { 64 };
+        for i in 0..budget {
             let ptr = unsafe { (self.api.wait_event)(self.handle, 0.0) };
             if ptr.is_null() { break; }
             let event = unsafe { &*ptr };
             if event.event_id == MPV_EVENT_NONE { break; }
+            if i + 1 == budget && self.profile_calls.get() {
+                yt_lite_extraction_proof::trace_event("mpv_event_budget", format_args!("events={budget}"));
+            }
             match event.event_id {
-                MPV_EVENT_START_FILE => events.push(PlaybackEvent::StartFile),
-                MPV_EVENT_FILE_LOADED => events.push(PlaybackEvent::FileLoaded),
-                MPV_EVENT_PLAYBACK_RESTART => events.push(PlaybackEvent::PlaybackRestart),
-                MPV_EVENT_COMMAND_REPLY if event.reply_userdata == LOADFILE_REPLY_ID && event.error < 0 => {
-                    events.push(PlaybackEvent::LoadFailed(event.error));
+                MPV_EVENT_GET_PROPERTY_REPLY => self.finish_seek_probe(event),
+                MPV_EVENT_PROPERTY_CHANGE if !event.data.is_null() => {
+                    self.apply_property_event(event.reply_userdata, unsafe { &*event.data.cast::<MpvEventProperty>() });
+                }
+                MPV_EVENT_QUEUE_OVERFLOW => {
+                    if self.profile_calls.get() { yt_lite_extraction_proof::trace_event("mpv_queue_overflow", format_args!("observed={}", self.observed.borrow().is_some())); }
+                    self.seek_probes.borrow_mut().clear();
+                    self.seek_missing_confirmation.set(None);
+                    self.reset_observations(self.observed_file_loaded.get());
+                }
+                MPV_EVENT_LOG_MESSAGE if !event.data.is_null() => {
+                    let msg = unsafe { &*event.data.cast::<MpvLogMessage>() };
+                    if !msg.text.is_null() {
+                        let text = unsafe { CStr::from_ptr(msg.text) }.to_string_lossy();
+                        let terminal = self.expected_preattached_audio.borrow().as_deref().is_some_and(|expected|
+                            yt_lite_native_player_proof::transport_recovery::terminal_audio_open_failure(&text, expected));
+                        let diagnostic = if terminal { Some("terminal_audio_open_failure") } else { safe_mpv_log(&text) };
+                        if let Some(kind) = diagnostic {
+                            if self.profile_calls.get() {
+                                let prefix = if msg.prefix.is_null() { "".into() } else { unsafe { CStr::from_ptr(msg.prefix) }.to_string_lossy() };
+                                let module = if prefix.contains("ffmpeg") || prefix.contains("lavf") { "ffmpeg" }
+                                    else if prefix.contains("demux") { "demux" }
+                                    else if prefix.contains("audio") || prefix.contains("ao/") { "audio" }
+                                    else if prefix.contains("video") || prefix.contains("vd/") { "video" }
+                                    else { "other" };
+                                yt_lite_extraction_proof::trace_event("mpv_diagnostic", format_args!("module={module} stream_hint={} kind={kind}", diagnostic_stream_hint(&text)));
+                            }
+                            events.push(PlaybackEvent::Diagnostic(kind));
+                        }
+                    }
+                }
+                MPV_EVENT_SEEK => {
+                    self.seek_missing_confirmation.set(None);
+                    if self.observed_file_loaded.get() { self.reset_observations(true); }
+                    events.push(PlaybackEvent::Seek);
+                }
+                MPV_EVENT_AUDIO_RECONFIG => events.push(PlaybackEvent::AudioReconfig),
+                MPV_EVENT_VIDEO_RECONFIG => events.push(PlaybackEvent::VideoReconfig),
+                MPV_EVENT_START_FILE => {
+                    self.observed_file_loaded.set(false);
+                    self.reset_observations(false);
+                    events.push(PlaybackEvent::StartFile);
+                }
+                MPV_EVENT_FILE_LOADED => {
+                    self.observed_file_loaded.set(true);
+                    self.reset_observations(true);
+                    events.push(PlaybackEvent::FileLoaded);
+                }
+                MPV_EVENT_PLAYBACK_RESTART => {
+                    if self.observed_file_loaded.get() { self.reset_observations(true); }
+                    events.push(PlaybackEvent::PlaybackRestart);
+                }
+                MPV_EVENT_COMMAND_REPLY if self.pending_load_reply.get() == Some(event.reply_userdata) => {
+                    self.pending_load_reply.set(None);
+                    if event.error < 0 { events.push(PlaybackEvent::LoadFailed(event.error)); }
+                }
+                MPV_EVENT_COMMAND_REPLY if self.seek_audio_reload_reply.get() == Some(event.reply_userdata) => {
+                    self.seek_audio_reload_reply.set(None);
+                    events.push(PlaybackEvent::SeekAudioReloadReply(event.error));
+                }
+                MPV_EVENT_COMMAND_REPLY if self.pending_audio_reply.get() == Some(event.reply_userdata) => {
+                    self.pending_audio_reply.set(None);
+                    if event.error < 0 {
+                        events.push(PlaybackEvent::ExternalAudioFailed(event.error));
+                    } else {
+                        events.push(PlaybackEvent::ExternalAudioAdded);
+                    }
                 }
                 MPV_EVENT_END_FILE if !event.data.is_null() => {
                     let end = unsafe { &*event.data.cast::<MpvEndFile>() };
+                    self.observed_file_loaded.set(false);
+                    self.reset_observations(false);
                     if end.reason == MPV_END_FILE_REASON_ERROR {
                         events.push(PlaybackEvent::LoadFailed(end.error));
                     } else if end.reason == 0 {
@@ -312,18 +691,168 @@ impl Player {
                 _ => {}
             }
         }
+        self.report_slow_call(started, "poll_events", c"event-queue");
         events
     }
 
+    // Separate async requests, not atomic samples or hardware clocks. Never
+    // populate the observed snapshot with these replies. Bounded to one batch.
+    pub fn request_seek_probe(&self, sample: usize, phase: &'static str, target: f64) {
+        let mut probes = self.seek_probes.borrow_mut();
+        if !probes.is_empty() {
+            yt_lite_extraction_proof::trace_event("seek_probe_skipped", format_args!("sample={sample} phase={phase} pending={}", probes.len()));
+            return;
+        }
+        yt_lite_extraction_proof::trace_event("seek_probe_begin", format_args!("sample={sample} phase={phase} target_s={target:.3}"));
+        for &(name, format) in &[(c"time-pos", MPV_FORMAT_DOUBLE), (c"audio-pts", MPV_FORMAT_DOUBLE),
+            (c"seeking", MPV_FORMAT_FLAG), (c"paused-for-cache", MPV_FORMAT_FLAG),
+            (c"audio-out-params/samplerate", MPV_FORMAT_DOUBLE)] {
+            let observed_at_request = if format == MPV_FORMAT_DOUBLE {
+                self.property_double(name)
+            } else {
+                self.property_flag(name).map(|v| if v { 1.0 } else { 0.0 })
+            };
+            let reply = self.allocate_reply();
+            let started = Instant::now();
+            let rc = unsafe { (self.api.get_property_async)(self.handle, reply, name.as_ptr(), format) };
+            self.report_slow_call(Some(started), "get_async_dispatch", name);
+            if rc >= 0 { probes.push(SeekProbe { reply, sample, phase, name, format, observed_at_request, started }); }
+            else { yt_lite_extraction_proof::trace_event("seek_probe_dispatch_failed", format_args!("sample={sample} phase={phase} property={} code={rc}", name.to_string_lossy())); }
+        }
+    }
+
+    fn finish_seek_probe(&self, event: &MpvEvent) {
+        let probe = {
+            let mut probes = self.seek_probes.borrow_mut();
+            let Some(index) = probes.iter().position(|p| p.reply == event.reply_userdata) else { return; };
+            probes.swap_remove(index)
+        };
+        let value = if event.error >= 0 && !event.data.is_null() {
+            let property = unsafe { &*event.data.cast::<MpvEventProperty>() };
+            if property.format == probe.format && !property.data.is_null()
+                && !property.name.is_null() && unsafe { CStr::from_ptr(property.name) } == probe.name {
+                if probe.format == MPV_FORMAT_DOUBLE {
+                    let v = unsafe { *property.data.cast::<f64>() };
+                    v.is_finite().then_some(v)
+                } else {
+                    Some(if unsafe { *property.data.cast::<c_int>() } != 0 { 1.0 } else { 0.0 })
+                }
+            } else { None }
+        } else { None };
+        let observed_now = if probe.format == MPV_FORMAT_DOUBLE {
+            self.property_double(probe.name)
+        } else {
+            self.property_flag(probe.name).map(|v| if v { 1.0 } else { 0.0 })
+        };
+        if probe.phase == "recovery_confirm" && probe.name == c"audio-pts" && event.error == -10
+            && probe.started.elapsed() <= std::time::Duration::from_millis(500) {
+            self.seek_missing_confirmation.set(Some((probe.sample, Instant::now())));
+        }
+        yt_lite_extraction_proof::trace_event("seek_probe_reply", format_args!(
+            "sample={} phase={} property={} elapsed_ms={} code={} requested_observed={:?} reply={value:?} current_observed={observed_now:?}",
+            probe.sample, probe.phase, probe.name.to_string_lossy(), probe.started.elapsed().as_millis(), event.error, probe.observed_at_request));
+    }
+
+    pub fn enable_observed_state(&self) {
+        *self.observed.borrow_mut() = Some(ObservedState::default());
+        eprintln!("[yt-lite] experimental observed playback state enabled");
+    }
+
+    fn reset_observations(&self, active: bool) {
+        let mut observed = self.observed.borrow_mut();
+        let Some(state) = observed.as_mut() else { return; };
+        let started = self.profile_calls.get().then(Instant::now);
+        if let Some(old) = state.active_id() {
+            unsafe { (self.api.unobserve_property)(self.handle, old); }
+        }
+        if let Some(id) = state.reset(active) {
+            for &(name, c_name, format) in OBSERVED_PROPERTIES {
+                let rc = unsafe { (self.api.observe_property)(self.handle, id, c_name.as_ptr(), format) };
+                if rc < 0 { eprintln!("[yt-lite] observe unavailable property={name} code={rc}"); }
+            }
+        }
+        self.report_slow_call(started, "observe_reset", c"playback-state");
+    }
+
+    fn apply_property_event(&self, id: u64, property: &MpvEventProperty) {
+        let mut observed = self.observed.borrow_mut();
+        let Some(state) = observed.as_mut() else { return; };
+        if state.active_id() != Some(id) || property.name.is_null() { return; }
+        let name = unsafe { CStr::from_ptr(property.name) };
+        let Some(&(key, _, expected)) = OBSERVED_PROPERTIES.iter().find(|entry| entry.1 == name) else { return; };
+        // mpv owns event data until the next wait_event. Copy scalars and
+        // only numerical cache ranges before returning; never free event data.
+        let value = if property.format == MPV_FORMAT_NONE || property.data.is_null() || property.format != expected {
+            None
+        } else { unsafe {
+            match expected {
+                MPV_FORMAT_DOUBLE => Some(ObservedValue::Double(*property.data.cast::<f64>())),
+                MPV_FORMAT_FLAG => Some(ObservedValue::Flag(*property.data.cast::<c_int>() != 0)),
+                MPV_FORMAT_NODE => Self::copy_cache_ranges(&*property.data.cast::<MpvNode>()).map(ObservedValue::Ranges),
+                _ => None,
+            }
+        } };
+        state.update(id, key, value);
+    }
+
+    pub fn enable_diagnostics(&self) {
+        self.profile_calls.set(true);
+        let rc = unsafe { (self.api.request_log_messages)(self.handle, c"v".as_ptr()) };
+        if rc < 0 { eprintln!("[yt-lite] mpv verbose diagnostics unavailable code={rc}"); }
+    }
+
+    /// Main demuxer only, as documented by mpv. Missing/invalid nodes are
+    /// unknown, not evidence of a cache miss. Read only before benchmark seeks.
+    pub fn main_cache_ranges(&self) -> Option<Vec<(f64, f64)>> {
+        if let Some(state) = self.observed.borrow().as_ref() { return state.ranges(); }
+        let mut node = MpvNode { value: MpvNodeValue { int64: 0 }, format: 0 };
+        unsafe {
+            let started = self.profile_calls.get().then(Instant::now);
+            let rc = (self.api.get_property)(self.handle, c"demuxer-cache-state".as_ptr(), 6,
+                (&mut node as *mut MpvNode).cast());
+            self.report_slow_call(started, "get_node", c"demuxer-cache-state");
+            if rc < 0 { return None; }
+            let result = Self::copy_cache_ranges(&node);
+            (self.api.free_node_contents)(&mut node);
+            result
+        }
+    }
+
+    unsafe fn copy_cache_ranges(node: &MpvNode) -> Option<Vec<(f64, f64)>> {
+        let (_, entries) = node.field(b"seekable-ranges")?.entries(7)?;
+        entries.iter().map(|entry| {
+            let start = entry.field(b"start")?.finite_double()?;
+            let end = entry.field(b"end")?.finite_double()?;
+            (start <= end).then_some((start, end))
+        }).collect::<Option<Vec<_>>>()
+    }
+
+    fn report_slow_call(&self, started: Option<Instant>, operation: &str, name: &CStr) {
+        if let Some(started) = started {
+            let us = started.elapsed().as_micros();
+            if us >= 10_000 {
+                // Names are compile-time property names from the bridge, not values.
+                yt_lite_extraction_proof::trace_event("mpv_slow_call",
+                    format_args!("op={operation} property={} elapsed_us={us}", name.to_string_lossy()));
+            }
+        }
+    }
+
     pub fn property_double(&self, name: &CStr) -> Option<f64> {
+        if let Some(state) = self.observed.borrow().as_ref() { return state.double(name.to_str().ok()?); }
         let mut value = 0.0f64;
+        let started = self.profile_calls.get().then(Instant::now);
         let status = unsafe { (self.api.get_property)(self.handle, name.as_ptr(), 5, (&mut value as *mut f64).cast()) };
+        self.report_slow_call(started, "get_double", name);
         (status >= 0 && value.is_finite()).then_some(value)
     }
 
     pub fn property_flag(&self, name: &CStr) -> Option<bool> {
+        if let Some(state) = self.observed.borrow().as_ref() { return state.flag(name.to_str().ok()?); }
         let mut value: c_int = 0;
+        let started = self.profile_calls.get().then(Instant::now);
         let status = unsafe { (self.api.get_property)(self.handle, name.as_ptr(), 3, (&mut value as *mut c_int).cast()) };
+        self.report_slow_call(started, "get_flag", name);
         (status >= 0).then_some(value != 0)
     }
 
@@ -362,5 +891,32 @@ impl Drop for Player {
             self.teardown_render();
         }
         unsafe { (self.api.terminate_destroy)(self.handle) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlaybackEvent, Player};
+    use std::{thread, time::{Duration, Instant}};
+
+    #[test]
+    #[ignore = "requires mpv-2.dll or libmpv-2.dll alongside the test executable"]
+    fn stopping_playback_discards_only_the_superseded_audio_reply() {
+        let player = Player::open().unwrap();
+        // With no file loaded, each audio command produces a failure reply.
+        let url = "http://127.0.0.1:1/unused";
+        player.add_external_audio(url).unwrap();
+        player.send_strings(&["stop".into()]).unwrap();
+        player.add_external_audio(url).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut failures = 0;
+        while Instant::now() < deadline {
+            failures += player.poll_events().into_iter()
+                .filter(|event| matches!(event, PlaybackEvent::ExternalAudioFailed(_)))
+                .count();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(failures, 1, "only the current audio command can fail playback");
     }
 }
