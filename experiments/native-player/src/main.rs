@@ -1165,6 +1165,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(start) = recovery_started { trace_event("startup_recovery_ready", format_args!("elapsed_ms={}", start.elapsed().as_millis())); }
             }
         }
+        if transport_recovery && !startup_complete && recovery_started.is_some()
+            && media_load_dispatched.is_some_and(|t| t.elapsed() >= ATTEMPT_BUDGET) {
+            failure.get_or_insert_with(|| "Startup attempt did not establish synchronized A/V within 10 seconds".into());
+        }
         if let Some(start) = load_started {
             let limit = if transport_recovery && !startup_complete { ATTEMPT_BUDGET } else { Duration::from_secs(30) };
             if start.elapsed() > limit {
