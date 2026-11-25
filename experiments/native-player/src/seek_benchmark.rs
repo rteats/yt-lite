@@ -15,6 +15,7 @@ struct Sample {
     seek_ms: Option<u128>,
     restart_ms: Option<u128>,
     landing: Option<f64>,
+    probes: u8,
 }
 
 pub struct SeekBenchmark {
@@ -26,14 +27,16 @@ pub struct SeekBenchmark {
     ready_since: Option<Instant>,
     phase_started: Instant,
     done: bool,
+    probe: bool,
+    fault_marker: Option<std::path::PathBuf>,
 }
 
 impl SeekBenchmark {
-    pub fn new(mode: SeekBenchmarkMode) -> Self {
+    pub fn new(mode: SeekBenchmarkMode, probe: bool, fault_marker: Option<std::path::PathBuf>) -> Self {
         eprintln!("[yt-lite] seek-bench begin mode={} samples={} settle_ms=2500 poll_ms=50",
             mode.label(), TARGETS.len());
         Self { mode, next: 0, wrong_landings: 0, duration: None, active: None, ready_since: None,
-            phase_started: Instant::now(), done: false }
+            phase_started: Instant::now(), done: false, probe, fault_marker }
     }
 
     pub fn abort(&mut self, reason: &'static str) {
@@ -75,10 +78,20 @@ impl SeekBenchmark {
             && player.property_flag(c"paused-for-cache") == Some(false)
             && position.zip(audio).is_some_and(|(p, a)| (p - a).abs() <= 0.5);
         if let Some(sample) = self.active.as_mut() {
+            if self.probe {
+                let elapsed = sample.started.elapsed();
+                for (bit, due, phase) in [(1, 1, "after_1s"), (2, 5, "after_5s"), (4, 15, "after_15s")] {
+                    if elapsed >= Duration::from_secs(due) && sample.probes & bit == 0 {
+                        sample.probes |= bit;
+                        player.request_seek_probe(sample.index, phase, sample.target);
+                    }
+                }
+            }
             if sample.restart_ms.is_some() && sample.landing.is_none() && seeking == Some(false) {
                 sample.landing = position;
             }
             if sample.restart_ms.is_some() && ready {
+                if self.probe { player.request_seek_probe(sample.index, "verdict", sample.target); }
                 let elapsed = sample.started.elapsed().as_millis();
                 let landing_error = sample.landing.map(|p| p - sample.target);
                 let status = if self.mode == SeekBenchmarkMode::Exact && !exact_seek_landing_ok(sample.target, sample.landing) {
@@ -96,6 +109,7 @@ impl SeekBenchmark {
                     self.abort(if self.wrong_landings == 0 { "complete" } else { "incorrect_landings" });
                 }
             } else if sample.started.elapsed() >= SEEK_TIMEOUT {
+                if self.probe { player.request_seek_probe(sample.index, "timeout", sample.target); }
                 self.abort("seek_timeout");
             }
             return;
@@ -120,13 +134,22 @@ impl SeekBenchmark {
         let index = self.next + 1;
         eprintln!("[yt-lite] seek-bench request mode={} sample={} target_s={target:.3} from_s={position:?} main_cache={membership} ranges={ranges:?} cache_s={cache_s:?}",
             self.mode.label(), index);
+        if index == 1 {
+            if let Some(marker) = self.fault_marker.as_ref() {
+                // Explicit local diagnostic only, never used during remote playback.
+                if std::fs::OpenOptions::new().write(true).create_new(true).open(marker).is_err() {
+                    self.abort("fault_arm_failed"); return;
+                }
+                eprintln!("[yt-lite] seek-bench fault armed sample=1");
+            }
+        }
         let command = self.mode.command(target).expect("valid benchmark target");
         let started = Instant::now();
         if player.send_strings(&command).is_err() {
             self.abort("dispatch_failed");
             return;
         }
-        self.active = Some(Sample { index, target, started, seek_ms: None, restart_ms: None, landing: None });
+        self.active = Some(Sample { index, target, started, seek_ms: None, restart_ms: None, landing: None, probes: 0 });
         self.ready_since = None;
     }
 }

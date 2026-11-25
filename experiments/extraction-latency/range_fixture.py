@@ -24,7 +24,11 @@ def byte_range(header, size):
         raise ValueError("unsatisfiable")
     return start, end, 206
 
-def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buffer_bytes=0):
+def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buffer_bytes=0, seek_marker=None, seek_fault=None):
+    if (seek_marker is None) != (seek_fault is None) or seek_fault not in (None, "once", "always", "delay"):
+        raise ValueError("invalid seek fault configuration")
+    if seek_fault and (fail_once or fail_always or audio_buffer_bytes):
+        raise ValueError("seek fault must be isolated")
     if not 0 <= audio_buffer_bytes <= 4 * 1024 * 1024:
         raise ValueError("invalid audio buffer cap")
     if audio_buffer_bytes and (fail_once or fail_always):
@@ -32,6 +36,7 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buff
     lock = threading.Lock()
     counter = 0
     failed = False
+    seek_injected = False
     origin = time.monotonic_ns()
 
     def now_ms():
@@ -60,7 +65,7 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buff
             self.serve_media(True)
 
         def serve_media(self, body):
-            nonlocal counter, failed
+            nonlocal counter, failed, seek_injected
             start_time = time.monotonic()
             started_ms = now_ms()
             match = re.fullmatch(r"/(?:attempt/([12])/)?(video\.mp4|audio\.m4a)", self.path)
@@ -73,6 +78,13 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buff
                 inject = body and kind is not None and (kind == fail_always or (kind == fail_once and not failed))
                 if inject:
                     failed = True
+                seek_action = None
+                # Only new audio GETs after the player explicitly arms the
+                # first seek. Existing response bodies are never modified.
+                if body and kind == "audio" and attempt == "0" and seek_marker is not None and seek_marker.is_file():
+                    if seek_fault == "always" or not seek_injected:
+                        seek_action = seek_fault
+                        seek_injected = True
             print(f"range-fixture event=request id={rid} stream={kind or 'unknown'} attempt={attempt} t_ms={started_ms}", flush=True)
             status, sent, lo, hi = 404, 0, None, None
             headers_ms = first_byte_ms = None
@@ -99,7 +111,11 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buff
                         cache = "audio_miss"
                 if delay_ms and cached is None:
                     time.sleep(delay_ms / 1000)
-                if inject:
+                if seek_action:
+                    print(f"range-fixture event=seek_fault id={rid} action={seek_action} t_ms={now_ms()}", flush=True)
+                    if seek_action == "delay":
+                        time.sleep(5)
+                if inject or seek_action in ("once", "always"):
                     status = 503
                     self.send_response(status)
                     self.send_header("Content-Length", "0")
@@ -157,7 +173,7 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buff
                       f"status={status} start={lo} end={hi} sent={sent} "
                       f"elapsed_ms={int((time.monotonic()-start_time)*1000)} attempt={attempt} "
                       f"started_ms={started_ms} headers_ms={headers_ms} first_write_ms={first_byte_ms} "
-                      f"ended_ms={now_ms()} outcome={outcome} cache={cache}", flush=True)
+                      f"ended_ms={now_ms()} outcome={outcome} cache={cache} seek_fault={seek_action}", flush=True)
 
     return Handler
 
@@ -170,7 +186,13 @@ def main():
     fault = p.add_mutually_exclusive_group()
     fault.add_argument("--fail-once", choices=["video", "audio"])
     fault.add_argument("--fail-always", choices=["video", "audio"])
+    p.add_argument("--seek-marker", type=Path)
+    p.add_argument("--seek-fault", choices=["once", "always", "delay"])
     a = p.parse_args()
+    if (a.seek_marker is None) != (a.seek_fault is None) or (a.seek_fault and (a.fail_once or a.fail_always or a.audio_buffer_bytes)):
+        p.error("seek marker and isolated seek fault required together")
+    if a.seek_marker is not None and a.seek_marker.exists():
+        p.error("seek marker already exists")
     if not 1 <= a.port <= 65535 or not 0 <= a.delay_ms <= 10000:
         p.error("invalid port or delay")
     if not 0 <= a.audio_buffer_bytes <= 4 * 1024 * 1024 or (a.audio_buffer_bytes and (a.fail_once or a.fail_always)):
@@ -178,7 +200,7 @@ def main():
     files = {"video": a.directory / "video.mp4", "audio": a.directory / "audio.m4a"}
     if any(not x.is_file() or x.stat().st_size <= 0 for x in files.values()):
         p.error("nonempty video.mp4 and audio.m4a required")
-    with ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(files, a.delay_ms, a.fail_once, a.fail_always, a.audio_buffer_bytes)) as server:
+    with ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(files, a.delay_ms, a.fail_once, a.fail_always, a.audio_buffer_bytes, a.seek_marker, a.seek_fault)) as server:
         print(f"range-fixture ready port={a.port} delay_ms={a.delay_ms} fail_once={a.fail_once} fail_always={a.fail_always} audio_buffer_bytes={a.audio_buffer_bytes}", flush=True)
         try:
             server.serve_forever()

@@ -131,6 +131,7 @@ pub enum PlaybackEvent {
 // COMMAND_REPLY=5; MPV_END_FILE_REASON_ERROR=4.
 const MPV_EVENT_NONE: c_int = 0;
 const MPV_EVENT_LOG_MESSAGE: c_int = 2;
+const MPV_EVENT_GET_PROPERTY_REPLY: c_int = 3;
 const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
 const MPV_EVENT_AUDIO_RECONFIG: c_int = 18;
 const MPV_EVENT_SEEK: c_int = 20;
@@ -206,6 +207,7 @@ struct Api {
     set_property_string: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     command_async: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
+    get_property_async: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
     free_node_contents: unsafe extern "C" fn(*mut MpvNode),
     observe_property: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
     unobserve_property: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
@@ -231,6 +233,7 @@ impl Api {
             set_property_string: get(library, b"mpv_set_property_string\0")?,
             command_async: get(library, b"mpv_command_async\0")?,
             get_property: get(library, b"mpv_get_property\0")?,
+            get_property_async: get(library, b"mpv_get_property_async\0")?,
             free_node_contents: get(library, b"mpv_free_node_contents\0")?,
             observe_property: get(library, b"mpv_observe_property\0")?,
             unobserve_property: get(library, b"mpv_unobserve_property\0")?,
@@ -290,6 +293,16 @@ unsafe extern "C" fn gl_proc(_ctx: *mut c_void, name: *const c_char) -> *mut c_v
     if module.is_null() { ptr::null_mut() } else { GetProcAddress(module, name) }
 }
 
+struct SeekProbe {
+    reply: u64,
+    sample: usize,
+    phase: &'static str,
+    name: &'static CStr,
+    format: c_int,
+    observed_at_request: Option<f64>,
+    started: Instant,
+}
+
 pub struct Player {
     api: Api,
     handle: *mut c_void,
@@ -302,6 +315,7 @@ pub struct Player {
     next_reply: Cell<u64>,
     pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
+    seek_probes: RefCell<Vec<SeekProbe>>,
     expected_preattached_audio: RefCell<Option<String>>,
     audio_cache: RefCell<Option<yt_lite_native_player_proof::audio_cache::AudioCache>>,
     last_video_margins: Option<(u64, u64, u64)>,
@@ -341,6 +355,7 @@ impl Player {
             next_reply: Cell::new(FIRST_REPLY_ID),
             pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
+            seek_probes: RefCell::new(Vec::new()),
             expected_preattached_audio: RefCell::new(None),
             audio_cache: RefCell::new(None),
             last_video_margins: None,
@@ -549,6 +564,7 @@ impl Player {
         if matches!(args.first().map(String::as_str), Some("stop" | "loadfile")) {
             self.pending_audio_reply.set(None);
             self.pending_load_reply.set(None);
+            self.seek_probes.borrow_mut().clear();
             self.expected_preattached_audio.borrow_mut().take();
             self.audio_cache.borrow_mut().take();
             self.observed_file_loaded.set(false);
@@ -574,11 +590,13 @@ impl Player {
                 yt_lite_extraction_proof::trace_event("mpv_event_budget", format_args!("events={budget}"));
             }
             match event.event_id {
+                MPV_EVENT_GET_PROPERTY_REPLY => self.finish_seek_probe(event),
                 MPV_EVENT_PROPERTY_CHANGE if !event.data.is_null() => {
                     self.apply_property_event(event.reply_userdata, unsafe { &*event.data.cast::<MpvEventProperty>() });
                 }
                 MPV_EVENT_QUEUE_OVERFLOW => {
                     if self.profile_calls.get() { yt_lite_extraction_proof::trace_event("mpv_queue_overflow", format_args!("observed={}", self.observed.borrow().is_some())); }
+                    self.seek_probes.borrow_mut().clear();
                     self.reset_observations(self.observed_file_loaded.get());
                 }
                 MPV_EVENT_LOG_MESSAGE if !event.data.is_null() => {
@@ -649,6 +667,60 @@ impl Player {
         }
         self.report_slow_call(started, "poll_events", c"event-queue");
         events
+    }
+
+    // Separate async requests, not atomic samples or hardware clocks. Never
+    // populate the observed snapshot with these replies. Bounded to one batch.
+    pub fn request_seek_probe(&self, sample: usize, phase: &'static str, target: f64) {
+        let mut probes = self.seek_probes.borrow_mut();
+        if !probes.is_empty() {
+            yt_lite_extraction_proof::trace_event("seek_probe_skipped", format_args!("sample={sample} phase={phase} pending={}", probes.len()));
+            return;
+        }
+        yt_lite_extraction_proof::trace_event("seek_probe_begin", format_args!("sample={sample} phase={phase} target_s={target:.3}"));
+        for &(name, format) in &[(c"time-pos", MPV_FORMAT_DOUBLE), (c"audio-pts", MPV_FORMAT_DOUBLE),
+            (c"seeking", MPV_FORMAT_FLAG), (c"paused-for-cache", MPV_FORMAT_FLAG),
+            (c"audio-out-params/samplerate", MPV_FORMAT_DOUBLE)] {
+            let observed_at_request = if format == MPV_FORMAT_DOUBLE {
+                self.property_double(name)
+            } else {
+                self.property_flag(name).map(|v| if v { 1.0 } else { 0.0 })
+            };
+            let reply = self.allocate_reply();
+            let started = Instant::now();
+            let rc = unsafe { (self.api.get_property_async)(self.handle, reply, name.as_ptr(), format) };
+            self.report_slow_call(Some(started), "get_async_dispatch", name);
+            if rc >= 0 { probes.push(SeekProbe { reply, sample, phase, name, format, observed_at_request, started }); }
+            else { yt_lite_extraction_proof::trace_event("seek_probe_dispatch_failed", format_args!("sample={sample} phase={phase} property={} code={rc}", name.to_string_lossy())); }
+        }
+    }
+
+    fn finish_seek_probe(&self, event: &MpvEvent) {
+        let probe = {
+            let mut probes = self.seek_probes.borrow_mut();
+            let Some(index) = probes.iter().position(|p| p.reply == event.reply_userdata) else { return; };
+            probes.swap_remove(index)
+        };
+        let value = if event.error >= 0 && !event.data.is_null() {
+            let property = unsafe { &*event.data.cast::<MpvEventProperty>() };
+            if property.format == probe.format && !property.data.is_null()
+                && !property.name.is_null() && unsafe { CStr::from_ptr(property.name) } == probe.name {
+                if probe.format == MPV_FORMAT_DOUBLE {
+                    let v = unsafe { *property.data.cast::<f64>() };
+                    v.is_finite().then_some(v)
+                } else {
+                    Some(if unsafe { *property.data.cast::<c_int>() } != 0 { 1.0 } else { 0.0 })
+                }
+            } else { None }
+        } else { None };
+        let observed_now = if probe.format == MPV_FORMAT_DOUBLE {
+            self.property_double(probe.name)
+        } else {
+            self.property_flag(probe.name).map(|v| if v { 1.0 } else { 0.0 })
+        };
+        yt_lite_extraction_proof::trace_event("seek_probe_reply", format_args!(
+            "sample={} phase={} property={} elapsed_ms={} code={} requested_observed={:?} reply={value:?} current_observed={observed_now:?}",
+            probe.sample, probe.phase, probe.name.to_string_lossy(), probe.started.elapsed().as_millis(), event.error, probe.observed_at_request));
     }
 
     pub fn enable_observed_state(&self) {

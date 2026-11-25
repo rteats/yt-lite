@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("Baseline","Cache","Interactive")]
+    [ValidateSet("Baseline","Cache","Interactive","SeekProbe")]
     [string]$Case,
     [string]$Url = "https://www.youtube.com/watch?v=xu1wRfUHtKg",
     [ValidatePattern("^[a-zA-Z0-9_-]{1,32}$")]
@@ -21,6 +21,7 @@ if ($Case -eq "Interactive") {
 } else {
     $playerArgs += @("--seek-benchmark","exact")
     if ($Case -eq "Cache") { $playerArgs += "--audio-cache" }
+    if ($Case -eq "SeekProbe") { $playerArgs += "--seek-probe" }
     Write-Host "Do not touch playback controls; close after seek-bench done."
 }
 $playerArgs += $Url

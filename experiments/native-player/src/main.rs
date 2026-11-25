@@ -535,6 +535,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut preattach_audio = false;
     let mut audio_cache = false;
     let mut seek_benchmark_mode = None;
+    let mut seek_probe = false;
+    let mut seek_fault_marker: Option<PathBuf> = None;
     let mut seek_fixture_audio: Option<PathBuf> = None;
     let mut seek_cache_expanded = false;
     let mut observed_state = false;
@@ -566,6 +568,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 preattach_audio = true;
             }
             "--seek-http-edl" => seek_http_edl = true,
+            "--seek-probe" => seek_probe = true,
+            "--seek-fault-marker" => seek_fault_marker = Some(PathBuf::from(args.next().ok_or("Missing --seek-fault-marker PATH")?)),
             "--seek-http-fixture" => {
                 let port: u16 = args.next().ok_or("Missing --seek-http-fixture PORT")?.parse()?;
                 if port == 0 { return Err("Fixture port must be nonzero".into()); }
@@ -653,6 +657,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if seek_http_fixture.is_some() && (clip.is_none() || seek_fixture_audio.is_some()) {
         return Err("HTTP fixture requires a local video path as fixture marker and no --seek-fixture-audio".into());
+    }
+    if seek_probe && (seek_benchmark_mode.is_none() || !observed_state) { return Err("--seek-probe requires --seek-benchmark and --observed-state".into()); }
+    if seek_fault_marker.is_some() && (seek_http_fixture.is_none() || seek_benchmark_mode.is_none() || seek_http_edl) {
+        return Err("--seek-fault-marker requires the external audio HTTP seek fixture".into());
     }
     if transport_recovery && seek_benchmark_mode.is_some() {
         return Err("Test startup recovery separately from the seek benchmark".into());
@@ -920,7 +928,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut awaiting_seek_audio: Option<(u64, Instant)> = None;
     let mut previous_wait_state = None;
     let mut last_tick = Instant::now();
-    let mut seek_benchmark = seek_benchmark_mode.map(seek_benchmark::SeekBenchmark::new);
+    let mut seek_benchmark = seek_benchmark_mode.map(|mode| seek_benchmark::SeekBenchmark::new(mode, seek_probe, seek_fault_marker));
     struct TickDuration(Option<Instant>);
     impl Drop for TickDuration {
         fn drop(&mut self) {

@@ -111,3 +111,31 @@ class RangeFixtureTest(unittest.TestCase):
             self.assertIn("cache=" + expected_cache, output)
             self.assertIn("stream=video method=GET status=206", output)
             self.assertEqual("attempt=prefetch" in output, expected_fetch)
+
+
+    def test_seek_fault_arms_only_after_marker_and_never_fails_video(self):
+        for fault in ("once", "always"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "media"
+                path.write_bytes(b"0123456789")
+                marker = Path(d) / "armed"
+                with ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
+                        {"video": path, "audio": path}, seek_marker=marker, seek_fault=fault)) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                    def get(kind, method="GET"):
+                        conn.request(method, f"/{kind}", headers={"Range": "bytes=2-4"})
+                        response = conn.getresponse()
+                        return response.status, response.read()
+                    try:
+                        self.assertEqual(get("audio.m4a"), (206, b"234"))
+                        marker.touch()
+                        self.assertEqual(get("audio.m4a", "HEAD"), (206, b""))
+                        self.assertEqual(get("video.mp4"), (206, b"234"))
+                        self.assertEqual(get("audio.m4a"), (503, b""))
+                        self.assertEqual(get("audio.m4a"), (206, b"234") if fault == "once" else (503, b""))
+                    finally:
+                        conn.close()
+                        server.shutdown()
+                        thread.join()

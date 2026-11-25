@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("Transient","Persistent","External","Edl","Faststart","BufferedAudio","BufferRejected")]
+    [ValidateSet("Transient","Persistent","External","Edl","Faststart","BufferedAudio","BufferRejected","SeekControl","SeekAudioOnce","SeekAudioAlways","SeekAudioDelay")]
     [string]$Case,
     [ValidateRange(1,65535)]
     [int]$Port = 8771
@@ -33,6 +33,7 @@ $serverLog = "$prefix-server.log"
 $serverErr = "$prefix-server-stderr.log"
 $playerLog = "$prefix-player.log"
 # Windows Start-Process joins ArgumentList, so quote filesystem arguments.
+ $marker = $null
 $serverArgs = @("-u", ('"{0}"' -f $server), "--directory", ('"{0}"' -f $fixtures), "--port", "$Port")
 if ($Case -eq "Transient") {
     $serverArgs += @("--fail-once", "audio")
@@ -42,6 +43,11 @@ if ($Case -eq "Transient") {
     $serverArgs += @("--delay-ms", "500")
     if ($Case -eq "BufferedAudio") { $serverArgs += @("--audio-buffer-bytes", "4194304") }
     if ($Case -eq "BufferRejected") { $serverArgs += @("--audio-buffer-bytes", "65536") }
+    if ($Case -in @("SeekAudioOnce","SeekAudioAlways","SeekAudioDelay")) {
+        $marker = Join-Path $env:TEMP ("yt-lite-seek-arm-" + [guid]::NewGuid().ToString("N"))
+        $fault = switch ($Case) { "SeekAudioOnce" { "once" } "SeekAudioAlways" { "always" } "SeekAudioDelay" { "delay" } }
+        $serverArgs += @("--seek-marker", ('"{0}"' -f $marker), "--seek-fault", $fault)
+    }
 }
 
 $process = Start-Process -FilePath $python -ArgumentList $serverArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr
@@ -66,6 +72,8 @@ try {
     } else {
         $playerArgs = @("--timings","--observed-state","--seek-benchmark","exact","--seek-http-fixture","$Port")
         if ($Case -eq "Edl") { $playerArgs += "--seek-http-edl" }
+        if ($Case -like "Seek*") { $playerArgs += "--seek-probe" }
+        if ($marker) { $playerArgs += @("--seek-fault-marker", $marker) }
         $playerArgs += $video
         Write-Host "Do not use player controls; close after seek-bench done."
     }
@@ -84,6 +92,7 @@ try {
         $process.WaitForExit()
     }
     $process.Dispose()
+    if ($marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
     Write-Host "Player log: $playerLog"
     Write-Host "Server log: $serverLog"
     Write-Host "Server stderr: $serverErr"
