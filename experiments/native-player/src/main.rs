@@ -6,7 +6,7 @@ mod mpv;
 mod seek_benchmark;
 
 use mpv::{PlaybackEvent, Player};
-use yt_lite_native_player_proof::transport_recovery::{startup_av_ready, StartupRecovery, RecoveryAction, RECOVERY_BUDGET, ATTEMPT_BUDGET};
+use yt_lite_native_player_proof::transport_recovery::{missing_required_audio_after_open_failure, startup_av_ready, StartupRecovery, RecoveryAction, RECOVERY_BUDGET, ATTEMPT_BUDGET};
 use yt_lite_extraction_proof::persistent::PersistentWorker;
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
@@ -537,6 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transport_recovery = false;
     let mut seek_http_fixture: Option<u16> = None;
     let mut startup_http_fixture: Option<u16> = None;
+    let mut seek_http_edl = false;
     let mut persistent_extraction = false;
     let mut worker_python = PathBuf::from("python");
     let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
@@ -559,6 +560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 observed_state = true;
                 preattach_audio = true;
             }
+            "--seek-http-edl" => seek_http_edl = true,
             "--seek-http-fixture" => {
                 let port: u16 = args.next().ok_or("Missing --seek-http-fixture PORT")?.parse()?;
                 if port == 0 { return Err("Fixture port must be nonzero".into()); }
@@ -636,6 +638,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if seek_benchmark_mode.is_some() && remote_url.is_none() && clip.is_none() {
         return Err("Seek benchmark requires a startup watch URL or local fixture".into());
     }
+    if seek_http_edl && seek_http_fixture.is_none() {
+        return Err("--seek-http-edl requires --seek-http-fixture".into());
+    }
     if seek_http_fixture.is_some() && (clip.is_none() || seek_fixture_audio.is_some()) {
         return Err("HTTP fixture requires a local video path as fixture marker and no --seek-fixture-audio".into());
     }
@@ -648,7 +653,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if seek_benchmark_mode.is_some() {
         eprintln!("[yt-lite] seek-bench config source={} cache={} forward_secs=8",
-            if seek_http_fixture.is_some() { "loopback_http_split" } else if seek_fixture_audio.is_some() { "local_split" } else if clip.is_some() { "local_muxed" } else { "remote" },
+            if seek_http_edl { "loopback_http_edl" } else if seek_http_fixture.is_some() { "loopback_http_split" } else if seek_fixture_audio.is_some() { "local_split" } else if clip.is_some() { "local_muxed" } else { "remote" },
             if seek_cache_expanded { "64MiB/32MiB" } else { "16MiB/4MiB" });
     }
     let initial_provider = preferred_playback_provider(requested_provider);
@@ -824,7 +829,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(port) = seek_http_fixture.filter(|_| clip.is_some()) {
                         let video = format!("http://127.0.0.1:{port}/video.mp4");
                         let audio = format!("http://127.0.0.1:{port}/audio.m4a");
-                        match session.load_network_with_audio(&video, &audio, &HttpPlaybackHeaders::default()) {
+                        trace_event("http_fixture_load_requested", format_args!("composition={}", if seek_http_edl { "edl" } else { "external_audio" }));
+                        let result = if seek_http_edl { session.load_loopback_edl(port) }
+                            else { session.load_network_with_audio(&video, &audio, &HttpPlaybackHeaders::default()) };
+                        match result {
                             Ok(()) => local_split_started = true,
                             Err(_) => eprintln!("[yt-lite] loopback HTTP fixture failed to load"),
                         }
@@ -886,6 +894,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut recovery_started: Option<Instant> = None;
     let mut startup_complete = false;
     let mut startup_split = false;
+    let mut explicit_audio_open_failure = false;
     let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let mut used_native_ejs = false;
     let mut used_fast_extraction = false;
@@ -1076,6 +1085,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending = None;
                     resolving = true;
                     remote_url = Some(canonical.clone());
+                    explicit_audio_open_failure = false;
                     startup_recovery = StartupRecovery::default();
                     recovery_started = None;
                     startup_complete = false;
@@ -1130,6 +1140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 trace_event("mpv_event", format_args!("load={active_trace:?} seek={:?} kind={event:?}", pending_seek_timing.borrow().as_ref().map(|(id, _)| *id)));
             }
             match event {
+                PlaybackEvent::Diagnostic("terminal_audio_open_failure") => {
+                    if transport_recovery && recovery_started.is_some() && !startup_complete && preattach_retry.is_some() {
+                        explicit_audio_open_failure = true;
+                    }
+                }
                 PlaybackEvent::Diagnostic(_) | PlaybackEvent::Seek | PlaybackEvent::AudioReconfig | PlaybackEvent::VideoReconfig => {}
                 PlaybackEvent::StartFile => {
                     // This may also fire when retrying; do not interpret as playback.
@@ -1205,6 +1220,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if startup_http_fixture.is_some() {
                     eprintln!("[yt-lite] startup-fixture done status=ready");
                 }
+            }
+        }
+        if transport_recovery && explicit_audio_open_failure && !startup_complete && preattach_retry.is_some() && file_loaded {
+            let player = label_player.borrow();
+            if missing_required_audio_after_open_failure(true, recovery_started.is_some(), file_loaded,
+                player.property_double(c"audio-pts"), player.property_double(c"audio-out-params/samplerate")) {
+                trace_event("startup_terminal_audio_failure", format_args!("load={active_trace:?} since_load_ms={:?}", media_load_dispatched.map(|t| t.elapsed().as_millis())));
+                failure.get_or_insert_with(|| "Required external audio could not open".into());
             }
         }
         if transport_recovery && !startup_complete && recovery_started.is_some()
@@ -1331,6 +1354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("[yt-lite] loading {} network stream (incremental HTTP)", provider_label(stream.provider));
                         fallback_muxed = stream.fallback_muxed;
                         preattach_retry = None;
+                        explicit_audio_open_failure = false;
                         media_load_dispatched = Some(Instant::now());
                         if transport_recovery && !startup_complete {
                             recovery_started.get_or_insert_with(Instant::now);
@@ -1380,6 +1404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if profile_timings { trace_event("playback_failure", format_args!("load={active_trace:?}")); }
             if transport_recovery && !startup_complete && recovery_started.is_some() && (remote_url.is_some() || startup_http_fixture.is_some()) {
                 let elapsed = recovery_started.unwrap().elapsed();
+                explicit_audio_open_failure = false;
                 let action = startup_recovery.next(elapsed, startup_split, fallback_muxed.is_some());
                 trace_event("startup_recovery_action", format_args!("action={action:?} elapsed_ms={}", elapsed.as_millis()));
                 let _ = label_player.borrow().send_strings(&["stop".into()]);

@@ -302,6 +302,7 @@ pub struct Player {
     next_reply: Cell<u64>,
     pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
+    expected_preattached_audio: RefCell<Option<String>>,
     last_video_margins: Option<(u64, u64, u64)>,
     _lib: Library,
 }
@@ -339,6 +340,7 @@ impl Player {
             next_reply: Cell::new(FIRST_REPLY_ID),
             pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
+            expected_preattached_audio: RefCell::new(None),
             last_video_margins: None,
             _lib: lib,
         };
@@ -421,6 +423,14 @@ impl Player {
         self.load_network_media(url, Some(audio), headers)
     }
 
+    pub fn load_loopback_edl(&mut self, port: u16) -> Result<(), String> {
+        if !self.is_render_ready() { return Err("libmpv render context is not ready yet".into()); }
+        let source = yt_lite_native_player_proof::loopback_edl_source(port).ok_or("Invalid fixture port")?;
+        self.send_loadfile(&source)?;
+        self.loaded = true;
+        Ok(())
+    }
+
     fn load_network_media(&mut self, url: &str, audio: Option<&str>, headers: &HttpPlaybackHeaders) -> Result<(), String> {
         if !self.is_render_ready() {
             return Err("libmpv render context is not ready yet".into());
@@ -439,6 +449,7 @@ impl Player {
         if let Some(audio) = audio {
             let args = preattached_audio_command(url, audio).ok_or("Invalid split HTTP media URL")?;
             self.send_load_command(&args)?;
+            *self.expected_preattached_audio.borrow_mut() = Some(audio.to_owned());
         } else {
             self.send_loadfile(url)?;
         }
@@ -525,6 +536,7 @@ impl Player {
         if matches!(args.first().map(String::as_str), Some("stop" | "loadfile")) {
             self.pending_audio_reply.set(None);
             self.pending_load_reply.set(None);
+            self.expected_preattached_audio.borrow_mut().take();
             self.observed_file_loaded.set(false);
             self.reset_observations(false);
         }
@@ -559,7 +571,10 @@ impl Player {
                     let msg = unsafe { &*event.data.cast::<MpvLogMessage>() };
                     if !msg.text.is_null() {
                         let text = unsafe { CStr::from_ptr(msg.text) }.to_string_lossy();
-                        if let Some(kind) = safe_mpv_log(&text) {
+                        let terminal = self.expected_preattached_audio.borrow().as_deref().is_some_and(|expected|
+                            yt_lite_native_player_proof::transport_recovery::terminal_audio_open_failure(&text, expected));
+                        let diagnostic = if terminal { Some("terminal_audio_open_failure") } else { safe_mpv_log(&text) };
+                        if let Some(kind) = diagnostic {
                             if self.profile_calls.get() {
                                 let prefix = if msg.prefix.is_null() { "".into() } else { unsafe { CStr::from_ptr(msg.prefix) }.to_string_lossy() };
                                 let module = if prefix.contains("ffmpeg") || prefix.contains("lavf") { "ffmpeg" }

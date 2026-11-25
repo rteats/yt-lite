@@ -64,3 +64,17 @@ pub fn startup_av_ready(video: Option<f64>, audio: Option<f64>, seeking: Option<
         && output_hz.is_some_and(|hz| hz.is_finite() && hz > 0.0)
         && video.zip(audio).is_some_and(|(v,a)| v.is_finite() && a.is_finite() && (v-a).abs() <= 0.5)
 }
+
+
+/// Recognize mpv's terminal external-file open error only for the exact
+/// current requested audio URL. Builds that redact the URL use the watchdog.
+pub fn terminal_audio_open_failure(message: &str, expected_audio: &str) -> bool {
+    !expected_audio.is_empty()
+        && message.trim_end_matches(&['\r', '\n'][..]).strip_prefix("Can not open external file ")
+            .and_then(|s| s.strip_suffix('.')) == Some(expected_audio)
+}
+
+pub fn missing_required_audio_after_open_failure(explicit_failure: bool, startup_pending: bool,
+    file_loaded: bool, audio_pts: Option<f64>, output_hz: Option<f64>) -> bool {
+    explicit_failure && startup_pending && file_loaded && audio_pts.is_none() && output_hz.is_none()
+}

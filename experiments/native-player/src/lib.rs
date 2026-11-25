@@ -339,3 +339,13 @@ pub fn diagnostic_stream_hint(text: &str) -> &'static str {
 pub mod observed_state;
 
 pub mod transport_recovery;
+
+
+/// EDL experiment uses fixed loopback fixture paths only.
+pub fn loopback_edl_source(port: u16) -> Option<String> {
+    if port == 0 { return None; }
+    let video = format!("http://127.0.0.1:{port}/video.mp4");
+    let audio = format!("http://127.0.0.1:{port}/audio.m4a");
+    Some(format!("edl://!new_stream;!no_clip;%{}%{};!new_stream;!no_clip;%{}%{}",
+        video.len(), video, audio.len(), audio))
+}

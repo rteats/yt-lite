@@ -43,3 +43,34 @@ fn split_fixture_without_muxed_candidate_stops_after_one_refresh() {
     assert_eq!(policy.next(Duration::from_secs(5), true, false), RecoveryAction::Refresh);
     assert_eq!(policy.next(Duration::from_secs(10), true, false), RecoveryAction::Stop);
 }
+
+
+#[test]
+fn only_current_external_audio_open_failure_is_terminal() {
+    use yt_lite_native_player_proof::transport_recovery::terminal_audio_open_failure;
+    let current = "http://127.0.0.1:8770/attempt/2/audio.m4a";
+    assert!(terminal_audio_open_failure("Can not open external file http://127.0.0.1:8770/attempt/2/audio.m4a.\n", current));
+    assert!(!terminal_audio_open_failure("Can not open external file http://127.0.0.1:8770/attempt/1/audio.m4a.\n", current));
+    assert!(!terminal_audio_open_failure("HTTP error 503", current));
+    assert!(!terminal_audio_open_failure("Audio output error", current));
+    assert!(!terminal_audio_open_failure("Can not open external file http://127.0.0.1:8770/attempt/2/video.mp4.\n", current));
+    assert!(!terminal_audio_open_failure("Can not open external file .", ""));
+}
+
+#[test]
+fn explicit_open_failure_only_recovers_during_unready_startup() {
+    use yt_lite_native_player_proof::transport_recovery::missing_required_audio_after_open_failure as check;
+    assert!(check(true, true, true, None, None));
+    assert!(!check(false, true, true, None, None));
+    assert!(!check(true, false, true, None, None));
+    assert!(!check(true, true, false, None, None));
+    assert!(!check(true, true, true, Some(0.0), None));
+    assert!(!check(true, true, true, None, Some(48000.0)));
+}
+
+#[test]
+fn edl_experiment_uses_only_two_length_quoted_loopback_sources() {
+    use yt_lite_native_player_proof::loopback_edl_source;
+    assert_eq!(loopback_edl_source(8766).as_deref(), Some("edl://!new_stream;!no_clip;%31%http://127.0.0.1:8766/video.mp4;!new_stream;!no_clip;%31%http://127.0.0.1:8766/audio.m4a"));
+    assert_eq!(loopback_edl_source(0), None);
+}

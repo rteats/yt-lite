@@ -69,3 +69,12 @@ R03 evidence recovery-persistent.log, recovery-persistent-server.log. R04 recove
 ## Decisions and unresolved work
 
 Keep persistent extraction, exact seeks, observed-state and preattachment available; all remain opt-in until broader remote validation and packaging. Reject skip-webpage and default keyframe seeking. Expanded cache inconclusive. Real CDN error cause unresolved. Next experiment: explicit terminal audio-open signal, bounded retry without watchdog delay; compare mpv EDL unified cache vs external audio and front-of-file MP4 metadata vs original tail placement. Preserve existing watchdog for unknown failures. Evaluate startup and seek separately; don't compare mismatched cache membership. No unmeasured gain presented as fact. Track every new experiment here, including failed or inconclusive runs, source filenames, exact options, raw sample measurements, verdict and limitations. See issue #30 for historical commit notes.
+
+
+## Planned experiments after R04 (not yet measured)
+
+- R05: repeat transient and persistent 503 with exact current audio-open error shortcut. Expected no five-second wait if DLL emits matching terminal message; compare Refresh/Stop/ready times, keep watchdog for ambiguous cases.
+- P13: external audio vs EDL loopback, original fixtures, 500 ms delay. Test if unified composition avoids sequential response waits; preserve all exact landings and A/V clocks. EDL may change cache semantics or fail entirely.
+- P14: original vs faststart stream-copy MP4/M4A, external audio, 500 ms delay. Test if metadata relocation removes tail requests and startup round trips; compare request count and startup duration. No production media conversion.
+
+Sources and reproducible instructions in extraction-latency.md. No native results claimed until Windows validation.
