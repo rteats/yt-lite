@@ -1,5 +1,7 @@
 # Playback extraction latency experiment
 
+For measured results, failed trials and decisions, see the [experiment register](playback-experiment-register.md). Keep this file focused on reproducible commands and experiment design. Historical statements below describe the state at the time each section was written; consult the register for later validation.
+
 The native-player flag `--fast-extraction` is opt-in. It keeps webpage retrieval, sets yt-dlp's socket timeout to 2.5 seconds, skips HLS, and uses the temporary TV player-JS variant workaround. Standard extraction remains the default. If the fast attempt fails, produces no compatible A/V selection, or the selected media and existing muxed fallback fail in libmpv, the player tries standard yt-dlp once before normal provider fallback. Search, downloads and the public extraction API are unchanged. Do not combine this flag with `--native-ejs` when benchmarking. Remove the temporary variant workaround after validating an upstream release.
 
 ## Windows player A/B
