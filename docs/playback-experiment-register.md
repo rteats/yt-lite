@@ -150,3 +150,38 @@ All five range-fixture unittest cases passed in 2.014s, including the two new ca
 | 64KiB | 502ms | 501ms | 501ms | Rejected before fetch |
 
 Range responses returned 206 and exact requested length. Demonstrates simulated upstream wait can be hidden and cap enforced; not a media seek result, not an estimate of real bandwidth (control requests only 100 bytes; buffering transfers substantially more), and not a Windows/Rust/remote integration test. Need actual mpv startup/seek timings from three runner cases before deciding on production design.
+
+
+### P15 Windows playback results (2026-11-25, yt-lite(1).zip)
+
+Archive contains all nine network-{external,bufferedaudio,bufferrejected}-{player,server,server-stderr}.log files. Runner baseline e7136f8/eec3297; player unchanged since 9c8a139. Three independent sessions, 500ms per origin response, same original 23,316,975-byte video and 1,541,755-byte audio, external audio, observed state, exact benchmark. Each completed six seeks, alternating main cache outside/inside, no incorrect landings. All server stderr files empty, no reported slow getter/tick/timer gap/queue overflow/event budget warnings. One run per mode.
+
+| Metric | External | BufferedAudio 4MiB | BufferRejected 64KiB |
+|---|---:|---:|---:|
+| FileLoaded ms | 2126 | 1142 | 2152 |
+| PlaybackRestart ms | 3262 | 1809 | 2835 |
+| A/V ready samples ms | 1055/73/1136/100/1133/133 | 611/67/645/144/631/144 | 1058/70/1117/140/1112/132 |
+| Outside median ms | 1133 | 631 | 1112 |
+| Inside median ms | 100 | 144 | 132 |
+| Max observed landing error ms | 116.7 | 116.7 | 116.7 |
+| Correct | 6/6 | 6/6 | 6/6 |
+| Video origin GETs | 6 | 6 | 6 |
+| Audio origin GETs | 6 | 1 | 6 |
+| Audio cache-hit GETs | 0 | 6 | 0 |
+| Video origin bytes written | 34050407 | 34115943 | 34836839 |
+| Audio origin bytes written | 4155196 | 1541755 | 4286268 |
+| Audio cache-hit bytes written | 0 | 4482876 | 0 |
+
+Playback startup measured from http_fixture_load_requested; restart is not independently verified audible output. Uncached median -502ms (-44.3%); observed startup restart -1453ms (-44.5%). Cached median +44ms, too few samples to establish systematic regression. All targets met except no strong evidence of equal cached latency. HEAD excluded from GET counts. Server sent counters count successful body writes, not network wire bytes, and may include overlapping/duplicate data or bytes not consumed before disconnect.
+
+Prefetch first video GET t912, prefetch begin t916, internal audio GET t919, video headers t1417, prefetch audio headers t1422, complete/ready t1424 (508ms, exactly 1541755 retained payload bytes). First player audio GET t1924 (500ms after cache ready). Six player audio GETs all hits. Rejected case logs over_budget size1541755 cap65536 at t921; no internal prefetch GET; all six audio requests miss with ordinary delay.
+
+| Buffered uncached seek | Video start -> headers (server ms) | Audio start -> headers (server ms) | Player A/V ready ms |
+|---|---|---|---:|
+| 1 | 5268 -> 5769 | 5806 -> 5807 | 611 |
+| 3 | 11175 -> 11678 | 11735 -> 11736 | 645 |
+| 5 | 17179 -> 17680 | 17728 -> 17729 | 631 |
+
+Video/audio request initiation still sequential, second origin wait removed by serving cached bytes. In this repeated-seek synthetic workload, origin audio bytes written fell from 4155196 to 1541755 (-62.9%); not a general bandwidth saving guarantee: full-track prefetch may waste bandwidth for users who stop early and may compete with video on real constrained links. Startup buffer payload about 1.47MiB, cap4MiB; no measured total RSS. Long or unknown-size audio and cache miss on real CDN not covered. No new Cargo output; previous 39 pass/1 ignored still latest Rust evidence.
+
+Decision: P15 passes controlled playback proof; investigate a production-capable opt-in audio cache, not unconditional full downloads. Prefer known size and small eligible direct HTTP audio, concurrent background prefetch with strict cap, timeout/cancellation/session isolation, ordinary streaming on miss, never delay initial playback waiting for prefetch beyond ordinary request need. Compare remote same-video alternating controls and diverse durations, bytes, first A/V readiness, exact seek landing, cache hit rate, RSS, failure/rapid replacement. Preserve 1080p and current recovery path; do not modify video transport. Need design/test seam for actual remote range handling before integration. No player/default change in this review.
