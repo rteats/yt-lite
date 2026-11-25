@@ -617,6 +617,7 @@ impl Player {
                 MPV_EVENT_QUEUE_OVERFLOW => {
                     if self.profile_calls.get() { yt_lite_extraction_proof::trace_event("mpv_queue_overflow", format_args!("observed={}", self.observed.borrow().is_some())); }
                     self.seek_probes.borrow_mut().clear();
+                    self.seek_missing_confirmation.set(None);
                     self.reset_observations(self.observed_file_loaded.get());
                 }
                 MPV_EVENT_LOG_MESSAGE if !event.data.is_null() => {

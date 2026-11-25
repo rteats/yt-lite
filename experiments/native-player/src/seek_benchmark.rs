@@ -87,7 +87,9 @@ impl SeekBenchmark {
     pub fn tick(&mut self, player: &Player, loaded: bool) {
         if self.done { return; }
         if !loaded {
-            if self.phase_started.elapsed() >= START_TIMEOUT { self.abort("startup_timeout"); }
+            if self.active.as_ref().is_some_and(|s| s.recovery_started.is_some_and(|t| t.elapsed() >= Duration::from_secs(12)) || (s.recovery_started.is_some() && s.started.elapsed() >= SEEK_TIMEOUT)) {
+                self.fail_recovery(player, "seek_recovery_timeout");
+            } else if self.phase_started.elapsed() >= START_TIMEOUT { self.abort("startup_timeout"); }
             return;
         }
         let position = player.property_double(c"time-pos");

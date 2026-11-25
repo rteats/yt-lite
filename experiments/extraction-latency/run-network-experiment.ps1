@@ -4,10 +4,12 @@ param(
     [ValidateSet("Transient","Persistent","External","Edl","Faststart","BufferedAudio","BufferRejected","SeekControl","SeekAudioOnce","SeekAudioAlways","SeekAudioDelay")]
     [string]$Case,
     [ValidateRange(1,65535)]
-    [int]$Port = 8771
+    [int]$Port = 8771,
+    [switch]$Recover
 )
 
 $ErrorActionPreference = "Stop"
+if ($Recover -and $Case -notlike "Seek*") { throw "-Recover requires a Seek case" }
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $player = (Resolve-Path (Join-Path $root "experiments\native-player\target\release\yt-lite-native-player-proof.exe")).Path
 $python = (Resolve-Path (Join-Path $root ".venv-extraction-bench\Scripts\python.exe")).Path
@@ -28,7 +30,8 @@ if ($Case -eq "Faststart") {
     $video = Join-Path $fast "video.mp4"
 }
 
-$prefix = Join-Path $root ("network-" + $Case.ToLowerInvariant())
+$suffix = if ($Recover) { "-recover" } else { "" }
+$prefix = Join-Path $root ("network-" + $Case.ToLowerInvariant() + $suffix)
 $serverLog = "$prefix-server.log"
 $serverErr = "$prefix-server-stderr.log"
 $playerLog = "$prefix-player.log"
@@ -73,6 +76,7 @@ try {
         $playerArgs = @("--timings","--observed-state","--seek-benchmark","exact","--seek-http-fixture","$Port")
         if ($Case -eq "Edl") { $playerArgs += "--seek-http-edl" }
         if ($Case -like "Seek*") { $playerArgs += "--seek-probe" }
+        if ($Recover) { $playerArgs += "--seek-recovery" }
         if ($marker) { $playerArgs += @("--seek-fault-marker", $marker) }
         $playerArgs += $video
         Write-Host "Do not use player controls; close after seek-bench done."
