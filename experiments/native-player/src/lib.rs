@@ -337,3 +337,5 @@ pub fn diagnostic_stream_hint(text: &str) -> &'static str {
 }
 
 pub mod observed_state;
+
+pub mod transport_recovery;

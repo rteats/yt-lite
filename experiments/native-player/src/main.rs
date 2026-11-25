@@ -6,6 +6,7 @@ mod mpv;
 mod seek_benchmark;
 
 use mpv::{PlaybackEvent, Player};
+use yt_lite_native_player_proof::transport_recovery::{StartupRecovery, RecoveryAction, RECOVERY_BUDGET, ATTEMPT_BUDGET};
 use yt_lite_extraction_proof::persistent::PersistentWorker;
 use slint::{ComponentHandle, GraphicsAPI, Model, RenderingState, Timer, TimerMode};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc::{self, Receiver, TryRecvError}, time::{Duration, Instant}};
@@ -516,6 +517,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seek_fixture_audio: Option<PathBuf> = None;
     let mut seek_cache_expanded = false;
     let mut observed_state = false;
+    let mut transport_recovery = false;
+    let mut seek_http_fixture: Option<u16> = None;
     let mut persistent_extraction = false;
     let mut worker_python = PathBuf::from("python");
     let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
@@ -528,6 +531,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--preattach-audio" => preattach_audio = true,
             "--seek-cache-expanded" => seek_cache_expanded = true,
             "--observed-state" => observed_state = true,
+            "--transport-recovery" => { transport_recovery = true; profile_timings = true; }
+            "--seek-http-fixture" => {
+                let port: u16 = args.next().ok_or("Missing --seek-http-fixture PORT")?.parse()?;
+                if port == 0 { return Err("Fixture port must be nonzero".into()); }
+                seek_http_fixture = Some(port);
+            }
             "--seek-fixture-audio" => {
                 let path = PathBuf::from(args.next().ok_or("Missing --seek-fixture-audio PATH")?).canonicalize()?;
                 if !path.is_file() { return Err("Audio fixture must be a local file".into()); }
@@ -591,18 +600,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
-    if (seek_cache_expanded || seek_fixture_audio.is_some()) && seek_benchmark_mode.is_none() {
+    if (seek_cache_expanded || seek_fixture_audio.is_some() || seek_http_fixture.is_some()) && seek_benchmark_mode.is_none() {
         return Err("Fixture and cache options require --seek-benchmark".into());
     }
     if seek_benchmark_mode.is_some() && remote_url.is_none() && clip.is_none() {
         return Err("Seek benchmark requires a startup watch URL or local fixture".into());
     }
+    if seek_http_fixture.is_some() && (clip.is_none() || seek_fixture_audio.is_some()) {
+        return Err("HTTP fixture requires a local video path as fixture marker and no --seek-fixture-audio".into());
+    }
+    if transport_recovery && seek_benchmark_mode.is_some() {
+        return Err("Test startup recovery separately from the seek benchmark".into());
+    }
+    if transport_recovery { eprintln!("[yt-lite] experimental startup recovery: fresh extraction once, 30s recovery budget"); }
     if seek_fixture_audio.is_some() && clip.is_none() {
         return Err("Audio fixture requires a local video file".into());
     }
     if seek_benchmark_mode.is_some() {
         eprintln!("[yt-lite] seek-bench config source={} cache={} forward_secs=8",
-            if seek_fixture_audio.is_some() { "local_split" } else if clip.is_some() { "local_muxed" } else { "remote" },
+            if seek_http_fixture.is_some() { "loopback_http_split" } else if seek_fixture_audio.is_some() { "local_split" } else if clip.is_some() { "local_muxed" } else { "remote" },
             if seek_cache_expanded { "64MiB/32MiB" } else { "16MiB/4MiB" });
     }
     let initial_provider = preferred_playback_provider(requested_provider);
@@ -769,11 +785,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             RenderingState::RenderingSetup => {
                 let mut session = video_session.borrow_mut();
                 let clip = rendering_clip.borrow();
-                let setup = session.setup_render(video_window.clone(), if rendering_audio.is_some() { None } else { clip.as_deref() });
+                let setup = session.setup_render(video_window.clone(), if rendering_audio.is_some() || seek_http_fixture.is_some() { None } else { clip.as_deref() });
                 if let Err(error) = setup {
                     eprintln!("Video initialization error: {error}");
                 } else if !local_split_started {
-                    if let (Some(video), Some(audio)) = (clip.as_deref(), rendering_audio.as_deref()) {
+                    if let Some(port) = seek_http_fixture.filter(|_| clip.is_some()) {
+                        let video = format!("http://127.0.0.1:{port}/video.mp4");
+                        let audio = format!("http://127.0.0.1:{port}/audio.m4a");
+                        match session.load_network_with_audio(&video, &audio, &HttpPlaybackHeaders::default()) {
+                            Ok(()) => local_split_started = true,
+                            Err(_) => eprintln!("[yt-lite] loopback HTTP fixture failed to load"),
+                        }
+                    } else if let (Some(video), Some(audio)) = (clip.as_deref(), rendering_audio.as_deref()) {
                         match session.load_local_split(video, audio) {
                             Ok(()) => local_split_started = true,
                             Err(_) => eprintln!("[yt-lite] local split fixture failed to load"),
@@ -827,6 +850,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Retain only the current split pair until the first audio clock is observed.
     let mut preattach_retry: Option<(String, String, HttpPlaybackHeaders)> = None;
     let mut media_load_dispatched: Option<Instant> = None;
+    let mut startup_recovery = StartupRecovery::default();
+    let mut recovery_started: Option<Instant> = None;
+    let mut startup_complete = false;
+    let mut startup_split = false;
     let mut fallback_muxed: Option<(String, HttpPlaybackHeaders)> = None;
     let mut used_native_ejs = false;
     let mut used_fast_extraction = false;
@@ -1016,6 +1043,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending = None;
                     resolving = true;
                     remote_url = Some(canonical.clone());
+                    startup_recovery = StartupRecovery::default();
+                    recovery_started = None;
+                    startup_complete = false;
+                    startup_split = false;
                     *browser_url.borrow_mut() = Some(canonical.clone());
                     clip_source.borrow_mut().take();
                     media_title = None;
@@ -1119,15 +1150,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         failure.get_or_insert_with(|| format!("mpv media load failed (code {code})"));
                     } else if remote_url.is_none() {
                         playback_error = Some(format!("Local media failed to load (mpv code {code})"));
+                        if let Some(bench) = seek_benchmark.as_mut() { bench.abort("playback_failure"); }
                     }
                 }
                 PlaybackEvent::Ended => {}
             }
         }
 
+        if transport_recovery && recovery_started.is_some() && !startup_complete && file_loaded {
+            let player = label_player.borrow();
+            if player.property_double(c"time-pos").zip(player.property_double(c"audio-pts"))
+                .is_some_and(|(v,a)| (v-a).abs() <= 0.5) && player.property_flag(c"seeking") == Some(false) {
+                startup_complete = true;
+                if let Some(start) = recovery_started { trace_event("startup_recovery_ready", format_args!("elapsed_ms={}", start.elapsed().as_millis())); }
+            }
+        }
         if let Some(start) = load_started {
-            if start.elapsed() > Duration::from_secs(30) {
-                failure.get_or_insert_with(|| "mpv did not load the network stream in 30 seconds".into());
+            let limit = if transport_recovery && !startup_complete { ATTEMPT_BUDGET } else { Duration::from_secs(30) };
+            if start.elapsed() > limit {
+                failure.get_or_insert_with(|| format!("mpv did not load the network stream in {} seconds", limit.as_secs()));
             }
         }
 
@@ -1184,6 +1225,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if transport_recovery && !startup_complete && recovery_started.is_some_and(|t| t.elapsed() >= RECOVERY_BUDGET) {
+            receiver = None;
+            pending = None;
+            failure = Some("Startup recovery budget exhausted".into());
+        }
         if let Some(response) = pending.take() {
             let ready = { label_player.borrow().is_render_ready() };
             if !ready {
@@ -1240,6 +1286,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         fallback_muxed = stream.fallback_muxed;
                         preattach_retry = None;
                         media_load_dispatched = Some(Instant::now());
+                        if transport_recovery && !startup_complete {
+                            recovery_started.get_or_insert_with(Instant::now);
+                            startup_split = stream.audio_url.is_some();
+                        }
                         if preattach_audio {
                             if let Some(audio) = stream.audio_url.as_ref() {
                                 preattach_retry = Some((stream.url.clone(), audio.clone(), stream.headers.clone()));
@@ -1282,7 +1332,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             awaiting_seek_audio = None;
             previous_wait_state = None;
             if profile_timings { trace_event("playback_failure", format_args!("load={active_trace:?}")); }
-            if let Some((video, audio, headers)) = preattach_retry.take() {
+            if transport_recovery && !startup_complete && recovery_started.is_some() && remote_url.is_some() {
+                let elapsed = recovery_started.unwrap().elapsed();
+                let action = startup_recovery.next(elapsed, startup_split, fallback_muxed.is_some());
+                trace_event("startup_recovery_action", format_args!("action={action:?} elapsed_ms={}", elapsed.as_millis()));
+                let _ = label_player.borrow().send_strings(&["stop".into()]);
+                receiver = None;
+                pending = None;
+                resolving = false;
+                load_started = None;
+                file_loaded = false;
+                file_loaded_at = None;
+                playback_advanced = false;
+                has_network_media = false;
+                pending_external_audio = None;
+                preattach_retry = None;
+                media_load_dispatched = None;
+                used_native_ejs = false;
+                used_fast_extraction = false;
+                if let Some(ui) = label_window.upgrade() { ui.set_has_media(false); ui.set_can_retry(false); }
+                match action {
+                    RecoveryAction::Refresh => {
+                        // Standard fresh extraction: do not reuse the failed split URLs.
+                        // Keep the old muxed candidate until a fresh response replaces it.
+                        let url = remote_url.as_ref().unwrap().clone();
+                        receiver = Some(spawn_extraction(url, helper.clone(), Provider::YtDlp, false, None, profile_timings, false, None));
+                        resolving = true;
+                        playback_error = None;
+                    }
+                    RecoveryAction::Muxed => {
+                        startup_split = false;
+                        let (url, headers) = fallback_muxed.take().unwrap();
+                        media_load_dispatched = Some(Instant::now());
+                        match label_player.borrow_mut().load_network_stream(&url, &headers) {
+                            Ok(()) => { load_started = media_load_dispatched; has_network_media = true; playback_error = None; }
+                            Err(_) => { pending = Some(Err("Combined stream fallback failed".into())); resolving = true; }
+                        }
+                    }
+                    RecoveryAction::Stop => {
+                        recovery_started = None;
+                        startup_complete = true; // terminal: don't re-arm on later ticks
+                        fallback_muxed = None;
+                        playback_error = Some("Startup recovery failed. Retry or open in Browser.".into());
+                        if let Some(ui) = label_window.upgrade() { ui.set_can_retry(true); }
+                    }
+                }
+            } else if let Some((video, audio, headers)) = preattach_retry.take() {
                 eprintln!("[yt-lite] preattached audio startup failed; retrying the same split streams serially");
                 if profile_timings { trace_event("preattached_audio_fallback", format_args!("load={active_trace:?} since_load_ms={:?}", media_load_dispatched.map(|t| t.elapsed().as_millis()))); }
                 let _ = label_player.borrow().send_strings(&["stop".into()]);

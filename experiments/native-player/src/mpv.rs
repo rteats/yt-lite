@@ -176,6 +176,7 @@ struct MpvLogMessage {
 
 // Classify only; do not print any raw message (may contain signed URLs).
 fn safe_mpv_log(text: &str) -> Option<&'static str> {
+    if let Some(kind) = yt_lite_native_player_proof::transport_recovery::transport_diagnostic(text) { return Some(kind); }
     let s = text.to_ascii_lowercase();
     if s.contains("timed out") || s.contains("timeout") { Some("network_timeout") }
     else if s.contains("http error") || s.contains("http response") { Some("http_error_or_response") }
