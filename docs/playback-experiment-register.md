@@ -192,3 +192,39 @@ Decision: P15 passes controlled playback proof; investigate a production-capable
 P15 established that available audio bytes remove the second origin wait. The extractor Stream schema currently omits exact filesize; use only known positive clen on direct HTTPS Googlevideo /videoplayback URLs, with actual response validation, not approximate bitrate or unknown size. Opt-in --audio-cache requires preattachment; no default/format changes. Local capability endpoint is per session, loopback only, random 128-bit token, no arbitrary target or proxy request. Starts speculative <=4MiB complete audio fetch during video initialization, serves complete cached byte ranges when ready; first demand while pending/failure permanently bypasses using 307 and cancels fetch, does not wait. Rejected size/protocol/origin uses direct URL immediately. One process-wide cache lease, 4 connection cap, 8s fetch timeout, cancellation on replacement/stop, no disk or video download. This is an explicitly approved small-audio-only experimental prefetch, not a required full-file download before playback (issue #30 prohibits full-file pre-download in normal path). Real CDN and libmpv redirect compatibility unvalidated; if first demand often wins, consider bounded partial range caching only after evidence. Local endpoint and signed origin never printed; existing sanitized diagnostics retained. Test actual HTTP seam plus eligibility/ranges; Windows build and A/B pending. Record actual cache-hit rate, startup and seeks, longer bypass, rapid switching and process RSS; compare at least two public videos alternating controls. No claims of remote speedup yet.
 
 P16 implementation commits: 73a5537 adds remote cache and tests; follow-up limits experimental entry to one attempt per explicitly selected watch and provides remote A/B runner. Automatic provider/transport retries use original direct audio, even if lease already retired. No Cargo or Windows PowerShell execution available in chat; build and all new test results pending. The expected success condition is an actual audio_cache_end status=ready followed by audio_cache_request result=hit, not merely cache flag present. Bypass is valid and may be frequent on fast video startup or slow audio fetch; measure rather than claim a gain. Local HTTP redirect behavior and total memory remain validation dependencies.
+
+
+### P16 Windows remote validation (yt-lite(2).zip, implementation 8f3f6cc)
+
+Full Cargo output supplied: 42 passed, zero failed, one ignored (DLL-dependent test); three audio_cache unit tests passed in 90ms. Native player executed five sessions. Four benchmark sessions use same public reference video xu1wRfUHtKg, formats 399/251, exact seek, observed state, persistent extraction and preattached audio. ABBA chronological order supplied by runner instructions, not independently timestamped across logs. No second benchmark video; interactive second video uses 399/251-11. No RSS or transferred origin byte measurements.
+
+| Metric | ref1 baseline | ref1 cache | ref2 baseline | ref2 cache |
+|---|---:|---:|---:|---:|
+| Persistent total ms | 3562 | 3261 | 3379 | 2948 |
+| Extract ms | 2648 | 2706 | 2790 | 2329 |
+| Cold worker queue ms | 896 | 537 | 572 | 593 |
+| FILE_LOADED ms | 804 | 602 | 807 | 701 |
+| First audio PTS since load ms | 1468 | 852 | 1050 | 926 |
+| Completed seek observations | 0 | 2 | 6 | 4 |
+| Correct landings | 0 | 2 | 2 | 4 |
+| Terminal verdict | seek_timeout sample1 | seek_timeout sample3 | incorrect_landings (4) | seek_timeout sample5 |
+| Cache hits | n/a | 0 | n/a | 0 |
+
+Both experimental short-video sessions eligible (clen=1460954 bytes). ref1 cache begin t2978, demand t3257 (+279ms), cancelled t3285 (+306ms); ref2 begin t2636, demand t2967 (+331ms), cancelled t3044 (+407ms). Interactive begin t3004, demand t3452 (+448ms), cancelled t3511 (+507ms). All 3/3 eligible prefetches cancelled before ready. All subsequent requests redirected (3/4/12 across those sessions, 19 total), no hits. Initial audio and later correct seeks show redirect can work, not proof of identical request behavior or reliability to direct origin. No evidence of cache-derived startup or seek acceleration. Full prefetch cannot finish within observed 279–448ms demand window; actual progress/body bytes and reason for slow fetch unknown because cancellation interrupts it. Do not raise cap or insert unconditional startup waiting based on this result.
+
+Seek observations (ms, first restart / A/V ready where available). '-' not attempted; timeout is 25s terminal, not a successful latency sample.
+
+| Sample | ref1 baseline | ref1 cache | ref2 baseline | ref2 cache |
+|---|---|---|---|---|
+| 1 | 5028 / timeout25010 | 435 / 501 OK | 6181 / 6257 wrong +0.747s | 515 / 515 OK |
+| 2 | - | 305 / 360 OK | 609 / 609 wrong +0.730s | 416 / 479 OK |
+| 3 | - | 5025 / timeout25035 | 608 / 657 wrong +29.095s | 2508 / 3617 OK |
+| 4 | - | - | 605 / 682 wrong +29.095s | 8089 / 9194 OK |
+| 5 | - | - | 203 / 267 OK | 5045 / timeout25045 |
+| 6 | - | - | 160 / 220 OK | - |
+
+Main cache membership differs: ref2 baseline samples 3/4 inside, ref2 cache sample4 outside. Do not pool as matched cache A/B; wrong landings and timeouts invalidate performance comparison. Three timeout sessions show video progression with absent audio PTS and explicit audio clock stalled warning at 56.1/27.3/74.7s respectively. Restart around 5s in all three, no explicit HTTP/transport error classification in those logs. ref2 baseline wrong target 23.638 lands 52.733 twice, recurrence of P03. This is a remote seek reliability blocker present without audio cache, not established to be caused by redirect or CDN. Actual silence unverified; output rate still 48kHz does not guarantee audio continuity. Need distinguish mpv observed-state/event freshness vs actual wrong playback and demux/network failure. No slow getter/tick/timer-gap markers across four benchmark sessions.
+
+Interactive: initial reference video startup 1852ms from dispatch to synchronized readiness. Multiple seek restart events without audio PTS, some recover later; user changed controls so not a controlled seek benchmark. One synchronous video-margin setter 42598us at replacement, no reported slow UI tick/gap. Session retired t64603 on replacement. Next persistent worker reused=true queue0 total2014ms extract1994ms (first interactive cold total3148ms extract2565ms queue565ms), first live reuse evidence on different video, not a controlled same-video speedup. Longer second audio rejected over_budget, startup ready1514ms. No automatic startup recovery actions. No proof of audible output or full long-video completion.
+
+Decision: P16 fails cache-effectiveness criterion (0/3 hits), passes offline tests and observed eligibility/redirect/retire behavior. Leave opt-in, do not promote. Prioritize remote exact-seek reliability: reproduce direct baseline audio disappearance and incorrect landing with deterministic range fault after initial playback, check observation freshness against independently sampled mpv state outside hot UI thread, add bounded post-start seek failure recovery preserving target and pause intent only after evidence. For further cache work, first measure prefetch header/bytes/progress without stalling playback, evaluate continuing an independent background fetch or demand-driven bounded range cache; beware duplicated origin traffic and extra redirect per seek. Do not commit to more complex proxy until reliability and bandwidth tradeoffs understood. No production code/default changes from this review.
