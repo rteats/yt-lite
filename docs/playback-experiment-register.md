@@ -78,3 +78,49 @@ Keep persistent extraction, exact seeks, observed-state and preattachment availa
 - P14: original vs faststart stream-copy MP4/M4A, external audio, 500 ms delay. Test if metadata relocation removes tail requests and startup round trips; compare request count and startup duration. No production media conversion.
 
 Sources and reproducible instructions in extraction-latency.md. No native results claimed until Windows validation.
+
+
+## Results: R05, P13, P14 (Windows, uploaded yt-lite.zip)
+
+Implementation baseline 9efe0c7 (fast terminal recovery/EDL 9c8a139, experiment runner 9efe0c7). Archive contains all 15 network-{transient,persistent,external,edl,faststart}-{player,server,server-stderr}.log files. Five server stderr files are empty. Direct log capture worked; some concurrent server lines concatenate, but request IDs and completion fields remain readable. HEAD readiness probe is excluded from all playback GET counts. Each mode tested once; no separate cargo test output in archive. Native executable ran all modes; Rust test suite not reconfirmed.
+
+### R05: immediate terminal audio-open failure recovery
+
+| Scenario | Previous elapsed ms | New elapsed ms | Result |
+|---|---:|---:|---|
+| Transient audio 503 | 6357 | 1282 | Refresh once, synchronized A/V ready |
+| Persistent audio 503 | 10926 | 788 | Refresh once, Stop; no false readiness |
+
+Transient: load t397; explicit terminal audio-open failure t669; Refresh t670 (reported elapsed 272); second load t917; FILE_LOADED t1169; PlaybackRestart and readiness t1679; second attempt first audio PTS 761ms (reported). Decoder/output 48000 Hz; later video 10.80s/audio 10.751s. Server attempt 1 audio GET id4 status503; attempt 2 audio GET ids8,9,10 status206; no third attempt. Persistent: load t280; failure and Refresh t551 (271ms); second load t799; failure and Stop t1069 (reported total788ms); server audio GET ids4,8 status503, distinct generations. Neither persistent attempt declared ready. Elapsed reductions 79.8% and 92.8% respectively. Both provisional targets met. No slow-call/tick/gap/overflow markers in fault runs. Audio clock evidence is not audible-output verification. Synthetic resolution, not fresh YouTube extraction/muxed fallback. Retain opt-in shortcut; bundled DLL emits matching message in these cases.
+
+### P13/P14: 500 ms delay, original external audio vs original EDL vs faststart external audio
+
+All modes observed state, exact seek, same six targets and cache membership alternating outside/inside, 16/4 MiB and 8s forward. Faststart stream-copy remux, same file sizes (video 23316975 bytes, audio 1541755 bytes), different layout. One run each. Times relative to new http_fixture_load_requested marker.
+
+| Mode | FileLoaded ms | PlaybackRestart ms | A/V ready samples ms | Outside median | Inside median | Correct | Startup GETs | Total GETs |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| External original | 2151 | 2887 | 1056/70/1139/133/1059/140 | 1059 | 133 | 6/6 | 6 | 12 |
+| EDL original | 2141 | 3356 | 1135/67/1131/100/1121/135 | 1131 | 100 | 6/6 | 6 | 12 |
+| External faststart | 1130 | 1333 | 1078/68/1055/140/1060/52 | 1060 | 68 | 6/6 | 2 | 8 |
+
+EDL: no seek improvement; outside median +72ms, startup restart +469ms. External original startup data pair request starts audio3031/video3033 (2ms apart), headers3533/3534; EDL corresponding audio3049 headers3551, video3554 headers4055, no header-wait overlap. Faststart eliminates tail/index and return-to-data GETs in this control, startup GETs 6 -> 2, observed restart -1554ms (-53.8%). No equivalent improvement claimed for remote formats. Cached latency small samples, not enough evidence of a systematic benefit. EDL not promoted.
+
+Uncached request times (server-relative ms; exclude HEAD, body transfer duration not RTT):
+
+| Mode | Seek | Video start -> headers | Audio start -> headers | Gap |
+|---|---:|---|---|---:|
+| External | 1 | 7276 -> 7776 | 7813 -> 8315 | 37 |
+| External | 3 | 13597 -> 14098 | 14151 -> 14652 | 53 |
+| External | 5 | 20083 -> 20585 | 20630 -> 21132 | 45 |
+| EDL | 1 | 6820 -> 7322 | 7326 -> 7829 | 4 |
+| EDL | 3 | 13244 -> 13746 | 13749 -> 14251 | 3 |
+| EDL | 5 | 19698 -> 20200 | 20203 -> 20704 | 3 |
+| Faststart | 1 | 4765 -> 5267 | 5303 -> 5804 | 36 |
+| Faststart | 3 | 11090 -> 11592 | 11638 -> 12139 | 46 |
+| Faststart | 5 | 17505 -> 18008 | 18054 -> 18555 | 46 |
+
+All nine pairs serialize header waits. EDL changes cache composition, not request dependency. One 1440ms UI timer gap in external-original run at t6359 before first seek, no accompanying mpv_slow_call or ui_tick_slow warnings. EDL/faststart no reported stalls; gap is unresolved and cannot be attributed to getters or network. All 18 landings correct. No server stderr in any run.
+
+### Next decision
+
+No more broad EDL/cache flag experiments without evidence. Investigate mpv demuxer seek implementation and independent per-track fetch scheduling before selecting a concurrency architecture. A transport-layer cache may reduce latency if it can predict required byte ranges, but merely replacing HTTP transport cannot remove serial demand. Consider separately whether lightweight bounded audio-only buffering could remove one request wait; measure bandwidth/memory and long-video/seek correctness, do not download full video or make a full-audio download the default. Prefer a limited controlled proof before integration. Consolidation of validated optimizations, remote multi-video/warm worker validation, packaging and unexplained timer gap remain pending. No code/default changes from results review.
