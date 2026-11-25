@@ -303,6 +303,7 @@ pub struct Player {
     pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
     expected_preattached_audio: RefCell<Option<String>>,
+    audio_cache: RefCell<Option<yt_lite_native_player_proof::audio_cache::AudioCache>>,
     last_video_margins: Option<(u64, u64, u64)>,
     _lib: Library,
 }
@@ -341,6 +342,7 @@ impl Player {
             pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
             expected_preattached_audio: RefCell::new(None),
+            audio_cache: RefCell::new(None),
             last_video_margins: None,
             _lib: lib,
         };
@@ -421,6 +423,17 @@ impl Player {
     /// Per-file options are restored by mpv when the file is replaced.
     pub fn load_network_with_audio(&mut self, url: &str, audio: &str, headers: &HttpPlaybackHeaders) -> Result<(), String> {
         self.load_network_media(url, Some(audio), headers)
+    }
+
+    /// Start speculative audio prefetch before video dispatch. If eligibility,
+    /// binding, randomness or worker startup fails, keep the original URL.
+    pub fn load_network_with_cached_audio(&mut self, video: &str, audio: &str, headers: &HttpPlaybackHeaders, id: u64) -> Result<(), String> {
+        self.audio_cache.borrow_mut().take();
+        let cache = yt_lite_native_player_proof::audio_cache::AudioCache::start(audio, headers, id);
+        let target = cache.as_ref().map(|c| c.url()).unwrap_or(audio);
+        self.load_network_media(video, Some(target), headers)?;
+        *self.audio_cache.borrow_mut() = cache;
+        Ok(())
     }
 
     pub fn load_loopback_edl(&mut self, port: u16) -> Result<(), String> {
@@ -537,6 +550,7 @@ impl Player {
             self.pending_audio_reply.set(None);
             self.pending_load_reply.set(None);
             self.expected_preattached_audio.borrow_mut().take();
+            self.audio_cache.borrow_mut().take();
             self.observed_file_loaded.set(false);
             self.reset_observations(false);
         }

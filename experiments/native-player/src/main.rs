@@ -313,6 +313,7 @@ fn time_label(seconds: f64) -> String {
 struct ResolvedStream {
     url: String,
     audio_url: Option<String>,
+    audio_direct_http: bool,
     fallback_muxed: Option<(String, HttpPlaybackHeaders)>,
     selected_height: Option<u64>,
     used_native_ejs: bool,
@@ -336,7 +337,7 @@ fn startup_fixture_resolution(port: u16, attempt: u8) -> Receiver<StreamResoluti
     let origin = format!("http://127.0.0.1:{port}/attempt/{attempt}");
     let _ = tx.send(Ok(ResolvedStream {
         url: format!("{origin}/video.mp4"), audio_url: Some(format!("{origin}/audio.m4a")),
-        fallback_muxed: None, selected_height: None, used_native_ejs: false,
+        audio_direct_http: false, fallback_muxed: None, selected_height: None, used_native_ejs: false,
         used_fast_extraction: false, used_persistent: false, trace: Some(trace_id()),
         video_format: "fixture-video".into(), audio_format: Some("fixture-audio".into()),
         watch: WatchMetadata { title: "HTTP startup fixture".into(), subtitle: "Loopback split media".into(), thumbnail_url: None },
@@ -392,6 +393,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                     PlaybackStreamSelection::Muxed(stream) => (stream.format_id.clone(), None),
                     PlaybackStreamSelection::Separate { video, audio } => (video.format_id.clone(), Some(audio.format_id.clone())),
                 };
+                let audio_direct_http = matches!(&selected, PlaybackStreamSelection::Separate { audio, .. } if matches!(audio.protocol.as_deref(), Some("https" | "http")));
                 let (url, audio_url, headers, selected_height, fallback_muxed) = match selected {
                     PlaybackStreamSelection::Muxed(stream) => (
                         stream.url.clone(), None, stream.http_headers.clone(),
@@ -408,6 +410,7 @@ fn spawn_extraction(video_url: String, helper: PathBuf, provider: Provider, lean
                 Ok(ResolvedStream {
                     url,
                     audio_url,
+                    audio_direct_http,
                     fallback_muxed,
                     selected_height,
                     used_native_ejs,
@@ -530,6 +533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lean_metadata = false;
     let mut fast_extraction = false;
     let mut preattach_audio = false;
+    let mut audio_cache = false;
     let mut seek_benchmark_mode = None;
     let mut seek_fixture_audio: Option<PathBuf> = None;
     let mut seek_cache_expanded = false;
@@ -548,6 +552,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--lean-metadata" => lean_metadata = true,
             "--fast-extraction" => fast_extraction = true,
             "--preattach-audio" => preattach_audio = true,
+            "--audio-cache" => { audio_cache = true; profile_timings = true; },
             "--seek-cache-expanded" => seek_cache_expanded = true,
             "--observed-state" => observed_state = true,
             "--transport-recovery" => { transport_recovery = true; profile_timings = true; }
@@ -605,6 +610,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fast_extraction && native_ejs.is_some() {
         return Err("Benchmark --fast-extraction and --native-ejs separately".into());
     }
+    if audio_cache && (!preattach_audio || startup_http_fixture.is_some() || seek_http_fixture.is_some() || seek_fixture_audio.is_some()) {
+        return Err("--audio-cache requires --preattach-audio and remote playback (no fixtures)".into());
+    }
+    if audio_cache { eprintln!("[yt-lite] experimental bounded audio prefetch enabled (4 MiB, immediate direct fallback)"); }
     if preattach_audio { eprintln!("[yt-lite] experimental preattached audio enabled (serial fallback retained)"); }
     if fast_extraction {
         eprintln!("[yt-lite] experimental fast extraction enabled (standard fallback retained)");
@@ -1369,7 +1378,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let preattached = preattach_retry.is_some();
                         if profile_timings { trace_event("load_requested", format_args!("load={active_trace:?} preattached={preattached}")); }
                         let result = if let Some((video, audio, headers)) = preattach_retry.as_ref() {
-                            label_player.borrow_mut().load_network_with_audio(video, audio, headers)
+                            // Retry bookkeeping retains the original CDN URL, never the local endpoint.
+                            if audio_cache && stream.audio_direct_http {
+                                label_player.borrow_mut().load_network_with_cached_audio(video, audio, headers, active_trace.unwrap_or_else(trace_id))
+                            } else {
+                                if audio_cache { trace_event("audio_cache_skip", format_args!("load={active_trace:?} reason=unsupported_protocol")); }
+                                label_player.borrow_mut().load_network_with_audio(video, audio, headers)
+                            }
                         } else {
                             label_player.borrow_mut().load_network_stream(&stream.url, &stream.headers)
                         };
