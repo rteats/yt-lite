@@ -1136,16 +1136,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(start) = file_loaded_at {
             let position = label_player.borrow().property_double(c"time-pos").unwrap_or(0.0);
             if position > 0.1 { playback_advanced = true; }
-            let manually_paused = label_player.borrow().property_flag(c"pause").unwrap_or(false);
+            let pause_state = label_player.borrow().property_flag(c"pause");
+            let manually_paused = pause_state.unwrap_or(false);
+            let unpaused = if observed_state {
+                pause_state == Some(false) || (pause_state.is_none() && start.elapsed() > Duration::from_secs(10))
+            } else { !manually_paused };
             if preattach_retry.is_some() {
                 if label_player.borrow().property_double(c"audio-pts").is_some() {
                     preattach_retry = None;
                     if profile_timings { trace_event("preattached_audio_ready", format_args!("load={active_trace:?} since_load_ms={:?}", media_load_dispatched.map(|t| t.elapsed().as_millis()))); }
-                } else if !manually_paused && start.elapsed() > Duration::from_secs(5) {
+                } else if unpaused && start.elapsed() > Duration::from_secs(5) {
                     failure.get_or_insert_with(|| "Preattached audio clock did not become available".into());
                 }
             }
-            if !playback_advanced && !manually_paused && start.elapsed() > Duration::from_secs(20) {
+            if !playback_advanced && unpaused && start.elapsed() > Duration::from_secs(20) {
                 failure.get_or_insert_with(|| "No decoded playback progress within 20 seconds".into());
             }
         }
@@ -1492,7 +1496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let old_warning = audio_warning;
                 let flags_known = !observed_state || [c"pause", c"seeking", c"paused-for-cache", c"mute", c"eof-reached"]
                     .iter().all(|name| player.property_flag(name).is_some());
-                audio_warning = audio_monitor.sample(position, audio_pts,
+                audio_warning = audio_monitor.sample(if observed_state { position } else { Some(elapsed) }, audio_pts,
                     flags_known && !paused && !seeking && !buffering && !muted && !eof && !near_end);
                 if old_warning != audio_warning {
                     eprintln!("[yt-lite] audio clock {} at {:.1}s", if audio_warning { "stalled" } else { "warning cleared" }, elapsed);

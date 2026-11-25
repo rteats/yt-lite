@@ -647,7 +647,7 @@ impl Player {
         let Some(state) = observed.as_mut() else { return; };
         if state.active_id() != Some(id) || property.name.is_null() { return; }
         let name = unsafe { CStr::from_ptr(property.name) };
-        let Some(&(key, _, expected)) = OBSERVED_PROPERTIES.iter().find(|(_, candidate, _)| *candidate == name) else { return; };
+        let Some(&(key, _, expected)) = OBSERVED_PROPERTIES.iter().find(|entry| entry.1 == name) else { return; };
         // mpv owns event data until the next wait_event. Copy scalars and
         // only numerical cache ranges before returning; never free event data.
         let value = if property.format == MPV_FORMAT_NONE || property.data.is_null() || property.format != expected {
