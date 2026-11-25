@@ -16,3 +16,23 @@ fn compare_explicit_seek_precision_without_changing_target() {
     assert!(SeekBenchmarkMode::Exact.command(f64::NAN).is_none());
     assert!(SeekBenchmarkMode::parse("other").is_none());
 }
+
+
+#[test]
+fn exact_seek_rejects_wrong_position_even_when_playback_recovers() {
+    use yt_lite_native_player_proof::exact_seek_landing_ok;
+    assert!(!exact_seek_landing_ok(23.638, Some(52.733)));
+    assert!(!exact_seek_landing_ok(70.913, Some(76.383)));
+    assert!(exact_seek_landing_ok(52.003, Some(52.083)));
+    assert!(!exact_seek_landing_ok(52.003, None));
+    assert!(!exact_seek_landing_ok(52.003, Some(f64::NAN)));
+}
+
+#[test]
+fn stream_classification_does_not_expose_url_or_guess_unknown() {
+    use yt_lite_native_player_proof::diagnostic_stream_hint;
+    assert_eq!(diagnostic_stream_hint("https://example.invalid/?mime=audio%2Fwebm&sig=SECRET"), "audio");
+    assert_eq!(diagnostic_stream_hint("mime=video%2Fmp4"), "video");
+    assert_eq!(diagnostic_stream_hint("HTTP error 403"), "unknown");
+    assert_eq!(diagnostic_stream_hint("mime=audio mime=video"), "unknown");
+}

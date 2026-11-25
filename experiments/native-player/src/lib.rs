@@ -315,3 +315,23 @@ impl SeekBenchmarkMode {
         Some(vec!["seek".into(), format!("{target:.3}"), format!("absolute+{}", self.label())])
     }
 }
+
+
+/// Diagnostic tolerance, deliberately larger than normal frame/50-ms polling
+/// error. This is a benchmark verdict, not a production seek policy.
+pub fn exact_seek_landing_ok(target: f64, landing: Option<f64>) -> bool {
+    target.is_finite() && landing.is_some_and(|p| p.is_finite() && (p - target).abs() <= 0.35)
+}
+
+/// Only fixed classifications leave the mpv bridge. An explicit MIME hint is
+/// not proof that every request by this demuxer belongs to the same stream.
+pub fn diagnostic_stream_hint(text: &str) -> &'static str {
+    let lower = text.to_ascii_lowercase();
+    let audio = lower.contains("mime=audio") || lower.contains("mime%3daudio");
+    let video = lower.contains("mime=video") || lower.contains("mime%3dvideo");
+    match (audio, video) {
+        (true, false) => "audio",
+        (false, true) => "video",
+        _ => "unknown",
+    }
+}

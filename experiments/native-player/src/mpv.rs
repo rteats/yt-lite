@@ -5,7 +5,7 @@
 //! frame pacing, GL state preservation and hardware decode have been measured.
 
 use crate::PlayerWindow;
-use yt_lite_native_player_proof::{preattached_audio_command, search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
+use yt_lite_native_player_proof::{diagnostic_stream_hint, preattached_audio_command, search_margin_ratio, video_margin_ratios, NETWORK_STREAM_OPTIONS};
 use yt_lite_extraction_proof::HttpPlaybackHeaders;
 use libloading::Library;
 use slint::{ComponentHandle, Weak};
@@ -14,6 +14,7 @@ use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
     path::Path,
     ptr,
+    time::Instant,
     sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
 };
 
@@ -258,6 +259,7 @@ pub struct Player {
     context: *mut c_void,
     wake: Option<Box<Wake>>,
     loaded: bool,
+    profile_calls: Cell<bool>,
     next_reply: Cell<u64>,
     pending_load_reply: Cell<Option<u64>>,
     pending_audio_reply: Cell<Option<u64>>,
@@ -266,7 +268,9 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn open() -> Result<Self, String> {
+    pub fn open() -> Result<Self, String> { Self::open_with_cache(false) }
+
+    pub fn open_with_cache(expanded: bool) -> Result<Self, String> {
         // Accept both names used by Windows libmpv builds, without searching PATH.
         let executable = std::env::current_exe().map_err(|err| err.to_string())?;
         let directory = executable.parent().ok_or("Missing executable directory")?;
@@ -290,6 +294,7 @@ impl Player {
             context: ptr::null_mut(),
             wake: None,
             loaded: false,
+            profile_calls: Cell::new(false),
             next_reply: Cell::new(FIRST_REPLY_ID),
             pending_load_reply: Cell::new(None),
             pending_audio_reply: Cell::new(None),
@@ -306,6 +311,12 @@ impl Player {
             ("osc", "no"),
             ("hwdec", "auto-safe"),
         ].into_iter().chain(NETWORK_STREAM_OPTIONS.iter().copied()) {
+            // Isolate retained cache capacity; do not change forward time target.
+            let value = if expanded { match key {
+                "demuxer-max-bytes" => "64MiB",
+                "demuxer-max-back-bytes" => "32MiB",
+                _ => value,
+            } } else { value };
             let key = CString::new(key).unwrap();
             let value = CString::new(value).unwrap();
             let status = unsafe { (player.api.set_option_string)(player.handle, key.as_ptr(), value.as_ptr()) };
@@ -337,6 +348,17 @@ impl Player {
                 self.loaded = true;
             }
         }
+        Ok(())
+    }
+
+    /// Diagnostic-only local split fixture, same mpv per-file audio option.
+    pub fn load_local_split(&mut self, video: &Path, audio: &Path) -> Result<(), String> {
+        if !self.is_render_ready() { return Err("render context not ready".into()); }
+        let video = video.to_str().ok_or("fixture path is not UTF-8")?;
+        let audio = audio.to_str().ok_or("fixture path is not UTF-8")?;
+        self.send_load_command(&["loadfile".into(), video.into(), "replace".into(), "-1".into(),
+            format!("audio-files-append=%{}%{}", audio.len(), audio)])?;
+        self.loaded = true;
         Ok(())
     }
 
@@ -386,7 +408,9 @@ impl Player {
     fn set_string_property(&self, name: &CStr, value: &str) -> Result<(), String> {
         let cvalue = CString::new(value)
             .map_err(|_| "Extractor returned an invalid HTTP header".to_string())?;
+        let started = self.profile_calls.get().then(Instant::now);
         let rc = unsafe { (self.api.set_property_string)(self.handle, name.as_ptr(), cvalue.as_ptr()) };
+        self.report_slow_call(started, "set_property", name);
         if rc < 0 {
             return Err(format!("mpv rejected HTTP request setting (code {rc})"));
         }
@@ -478,7 +502,18 @@ impl Player {
                     let msg = unsafe { &*event.data.cast::<MpvLogMessage>() };
                     if !msg.text.is_null() {
                         let text = unsafe { CStr::from_ptr(msg.text) }.to_string_lossy();
-                        if let Some(kind) = safe_mpv_log(&text) { events.push(PlaybackEvent::Diagnostic(kind)); }
+                        if let Some(kind) = safe_mpv_log(&text) {
+                            if self.profile_calls.get() {
+                                let prefix = if msg.prefix.is_null() { "".into() } else { unsafe { CStr::from_ptr(msg.prefix) }.to_string_lossy() };
+                                let module = if prefix.contains("ffmpeg") || prefix.contains("lavf") { "ffmpeg" }
+                                    else if prefix.contains("demux") { "demux" }
+                                    else if prefix.contains("audio") || prefix.contains("ao/") { "audio" }
+                                    else if prefix.contains("video") || prefix.contains("vd/") { "video" }
+                                    else { "other" };
+                                yt_lite_extraction_proof::trace_event("mpv_diagnostic", format_args!("module={module} stream_hint={} kind={kind}", diagnostic_stream_hint(&text)));
+                            }
+                            events.push(PlaybackEvent::Diagnostic(kind));
+                        }
                     }
                 }
                 MPV_EVENT_SEEK => events.push(PlaybackEvent::Seek),
@@ -514,6 +549,7 @@ impl Player {
     }
 
     pub fn enable_diagnostics(&self) {
+        self.profile_calls.set(true);
         let rc = unsafe { (self.api.request_log_messages)(self.handle, c"v".as_ptr()) };
         if rc < 0 { eprintln!("[yt-lite] mpv verbose diagnostics unavailable code={rc}"); }
     }
@@ -523,8 +559,10 @@ impl Player {
     pub fn main_cache_ranges(&self) -> Option<Vec<(f64, f64)>> {
         let mut node = MpvNode { value: MpvNodeValue { int64: 0 }, format: 0 };
         unsafe {
+            let started = self.profile_calls.get().then(Instant::now);
             let rc = (self.api.get_property)(self.handle, c"demuxer-cache-state".as_ptr(), 6,
                 (&mut node as *mut MpvNode).cast());
+            self.report_slow_call(started, "get_node", c"demuxer-cache-state");
             if rc < 0 { return None; }
             let result = (|| {
                 let (_, entries) = node.field(b"seekable-ranges")?.entries(7)?;
@@ -539,15 +577,30 @@ impl Player {
         }
     }
 
+    fn report_slow_call(&self, started: Option<Instant>, operation: &str, name: &CStr) {
+        if let Some(started) = started {
+            let us = started.elapsed().as_micros();
+            if us >= 10_000 {
+                // Names are compile-time property names from the bridge, not values.
+                yt_lite_extraction_proof::trace_event("mpv_slow_call",
+                    format_args!("op={operation} property={} elapsed_us={us}", name.to_string_lossy()));
+            }
+        }
+    }
+
     pub fn property_double(&self, name: &CStr) -> Option<f64> {
         let mut value = 0.0f64;
+        let started = self.profile_calls.get().then(Instant::now);
         let status = unsafe { (self.api.get_property)(self.handle, name.as_ptr(), 5, (&mut value as *mut f64).cast()) };
+        self.report_slow_call(started, "get_double", name);
         (status >= 0 && value.is_finite()).then_some(value)
     }
 
     pub fn property_flag(&self, name: &CStr) -> Option<bool> {
         let mut value: c_int = 0;
+        let started = self.profile_calls.get().then(Instant::now);
         let status = unsafe { (self.api.get_property)(self.handle, name.as_ptr(), 3, (&mut value as *mut c_int).cast()) };
+        self.report_slow_call(started, "get_flag", name);
         (status >= 0).then_some(value != 0)
     }
 

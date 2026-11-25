@@ -1,7 +1,7 @@
 //! Controlled, opt-in seek experiment on the actual libmpv playback session.
 use crate::mpv::{PlaybackEvent, Player};
 use std::time::{Duration, Instant};
-use yt_lite_native_player_proof::{main_cache_membership, SeekBenchmarkMode};
+use yt_lite_native_player_proof::{exact_seek_landing_ok, main_cache_membership, SeekBenchmarkMode};
 
 const TARGETS: [f64; 6] = [0.55, 0.55, 0.25, 0.25, 0.75, 0.75];
 const SETTLE: Duration = Duration::from_millis(2500);
@@ -20,6 +20,7 @@ struct Sample {
 pub struct SeekBenchmark {
     mode: SeekBenchmarkMode,
     next: usize,
+    wrong_landings: usize,
     duration: Option<f64>,
     active: Option<Sample>,
     ready_since: Option<Instant>,
@@ -31,7 +32,7 @@ impl SeekBenchmark {
     pub fn new(mode: SeekBenchmarkMode) -> Self {
         eprintln!("[yt-lite] seek-bench begin mode={} samples={} settle_ms=2500 poll_ms=50",
             mode.label(), TARGETS.len());
-        Self { mode, next: 0, duration: None, active: None, ready_since: None,
+        Self { mode, next: 0, wrong_landings: 0, duration: None, active: None, ready_since: None,
             phase_started: Instant::now(), done: false }
     }
 
@@ -43,7 +44,7 @@ impl SeekBenchmark {
                 sample.seek_ms, sample.restart_ms);
         }
         self.done = true;
-        eprintln!("[yt-lite] seek-bench done mode={} completed={} status={reason}", self.mode.label(), self.next);
+        eprintln!("[yt-lite] seek-bench done mode={} completed={} wrong_landings={} status={reason}", self.mode.label(), self.next, self.wrong_landings);
     }
 
     pub fn on_event(&mut self, event: PlaybackEvent) {
@@ -80,14 +81,20 @@ impl SeekBenchmark {
             if sample.restart_ms.is_some() && ready {
                 let elapsed = sample.started.elapsed().as_millis();
                 let landing_error = sample.landing.map(|p| p - sample.target);
-                eprintln!("[yt-lite] seek-bench result mode={} sample={} status=ok seek_ms={:?} restart_ms={:?} av_ready_ms={} target_s={:.3} landing_s={:?} landing_error_s={:?} video_s={:?} audio_s={:?}",
+                let status = if self.mode == SeekBenchmarkMode::Exact && !exact_seek_landing_ok(sample.target, sample.landing) {
+                    self.wrong_landings += 1;
+                    "wrong_landing"
+                } else { "ok" };
+                eprintln!("[yt-lite] seek-bench result mode={} sample={} status={status} seek_ms={:?} restart_ms={:?} av_ready_ms={} target_s={:.3} landing_s={:?} landing_error_s={:?} video_s={:?} audio_s={:?}",
                     self.mode.label(), sample.index, sample.seek_ms, sample.restart_ms, elapsed,
                     sample.target, sample.landing, landing_error, position, audio);
                 self.active = None;
                 self.next += 1;
                 self.ready_since = None;
                 self.phase_started = Instant::now();
-                if self.next == TARGETS.len() { self.abort("complete"); }
+                if self.next == TARGETS.len() {
+                    self.abort(if self.wrong_landings == 0 { "complete" } else { "incorrect_landings" });
+                }
             } else if sample.started.elapsed() >= SEEK_TIMEOUT {
                 self.abort("seek_timeout");
             }

@@ -513,6 +513,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fast_extraction = false;
     let mut preattach_audio = false;
     let mut seek_benchmark_mode = None;
+    let mut seek_fixture_audio: Option<PathBuf> = None;
+    let mut seek_cache_expanded = false;
     let mut persistent_extraction = false;
     let mut worker_python = PathBuf::from("python");
     let mut worker_script = PathBuf::from("experiments/extraction-latency/worker.py");
@@ -523,6 +525,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--lean-metadata" => lean_metadata = true,
             "--fast-extraction" => fast_extraction = true,
             "--preattach-audio" => preattach_audio = true,
+            "--seek-cache-expanded" => seek_cache_expanded = true,
+            "--seek-fixture-audio" => {
+                let path = PathBuf::from(args.next().ok_or("Missing --seek-fixture-audio PATH")?).canonicalize()?;
+                if !path.is_file() { return Err("Audio fixture must be a local file".into()); }
+                seek_fixture_audio = Some(path);
+            }
             "--seek-benchmark" => {
                 let mode = args.next().ok_or("Missing --seek-benchmark exact|keyframes")?;
                 seek_benchmark_mode = Some(yt_lite_native_player_proof::SeekBenchmarkMode::parse(&mode)
@@ -581,8 +589,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.is_file() { return Err("Local video path must point to a file".into()); }
         (Some(path), None)
     };
-    if seek_benchmark_mode.is_some() && remote_url.is_none() {
-        return Err("Seek benchmark requires a startup YouTube watch URL".into());
+    if (seek_cache_expanded || seek_fixture_audio.is_some()) && seek_benchmark_mode.is_none() {
+        return Err("Fixture and cache options require --seek-benchmark".into());
+    }
+    if seek_benchmark_mode.is_some() && remote_url.is_none() && clip.is_none() {
+        return Err("Seek benchmark requires a startup watch URL or local fixture".into());
+    }
+    if seek_fixture_audio.is_some() && clip.is_none() {
+        return Err("Audio fixture requires a local video file".into());
+    }
+    if seek_benchmark_mode.is_some() {
+        eprintln!("[yt-lite] seek-bench config source={} cache={} forward_secs=8",
+            if seek_fixture_audio.is_some() { "local_split" } else if clip.is_some() { "local_muxed" } else { "remote" },
+            if seek_cache_expanded { "64MiB/32MiB" } else { "16MiB/4MiB" });
     }
     let initial_provider = preferred_playback_provider(requested_provider);
     let persistent = if persistent_extraction {
@@ -670,7 +689,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let clip_source = Rc::new(RefCell::new(clip));
-    let player = Rc::new(RefCell::new(Player::open()?));
+    let player = Rc::new(RefCell::new(if seek_cache_expanded { Player::open_with_cache(true)? } else { Player::open()? }));
     if profile_timings { player.borrow().enable_diagnostics(); }
 
     let seek_started = Rc::new(RefCell::new(None::<(u64, Instant)>));
@@ -738,13 +757,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_window = window.as_weak();
     let video_session = player.clone();
     let rendering_clip = clip_source.clone();
+    let rendering_audio = seek_fixture_audio;
+    let mut local_split_started = false;
     let mut margin_warning_logged = false;
     window.window().set_rendering_notifier(move |phase, api| {
         if !matches!(api, GraphicsAPI::NativeOpenGL { .. }) { return; }
         match phase {
             RenderingState::RenderingSetup => {
-                if let Err(error) = video_session.borrow_mut().setup_render(video_window.clone(), rendering_clip.borrow().as_deref()) {
+                let mut session = video_session.borrow_mut();
+                let clip = rendering_clip.borrow();
+                let setup = session.setup_render(video_window.clone(), if rendering_audio.is_some() { None } else { clip.as_deref() });
+                if let Err(error) = setup {
                     eprintln!("Video initialization error: {error}");
+                } else if !local_split_started {
+                    if let (Some(video), Some(audio)) = (clip.as_deref(), rendering_audio.as_deref()) {
+                        match session.load_local_split(video, audio) {
+                            Ok(()) => local_split_started = true,
+                            Err(_) => eprintln!("[yt-lite] local split fixture failed to load"),
+                        }
+                    }
                 }
             }
             RenderingState::BeforeRendering => {
@@ -1037,6 +1068,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 PlaybackEvent::FileLoaded => {
+                    if remote_url.is_none() && clip_source.borrow().is_some() { file_loaded = true; }
                     if (remote_url.is_none() || load_started.is_some()) && label_window.upgrade().is_some() {
                         if let Some(ui) = label_window.upgrade() {
                             ui.set_has_media(true);
@@ -1364,7 +1396,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(bench) = seek_benchmark.as_mut() {
-            bench.tick(&label_player.borrow(), has_network_media && file_loaded && !resolving && playback_error.is_none());
+            bench.tick(&label_player.borrow(), (has_network_media || clip_source.borrow().is_some()) && file_loaded && !resolving && playback_error.is_none());
         }
 
         // During startup/seek, sample at the UI tick; during
