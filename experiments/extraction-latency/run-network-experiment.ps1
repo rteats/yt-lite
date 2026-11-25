@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("Transient","Persistent","External","Edl","Faststart")]
+    [ValidateSet("Transient","Persistent","External","Edl","Faststart","BufferedAudio","BufferRejected")]
     [string]$Case,
     [ValidateRange(1,65535)]
     [int]$Port = 8771
@@ -40,6 +40,8 @@ if ($Case -eq "Transient") {
     $serverArgs += @("--fail-always", "audio")
 } else {
     $serverArgs += @("--delay-ms", "500")
+    if ($Case -eq "BufferedAudio") { $serverArgs += @("--audio-buffer-bytes", "4194304") }
+    if ($Case -eq "BufferRejected") { $serverArgs += @("--audio-buffer-bytes", "65536") }
 }
 
 $process = Start-Process -FilePath $python -ArgumentList $serverArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr

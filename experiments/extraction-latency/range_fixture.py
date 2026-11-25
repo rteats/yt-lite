@@ -5,6 +5,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from audio_prefetch import AudioPrefetch
 
 def byte_range(header, size):
     if header is None:
@@ -23,7 +24,11 @@ def byte_range(header, size):
         raise ValueError("unsatisfiable")
     return start, end, 206
 
-def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
+def make_handler(files, delay_ms=0, fail_once=None, fail_always=None, audio_buffer_bytes=0):
+    if not 0 <= audio_buffer_bytes <= 4 * 1024 * 1024:
+        raise ValueError("invalid audio buffer cap")
+    if audio_buffer_bytes and (fail_once or fail_always):
+        raise ValueError("buffer experiment must not be combined with fault injection")
     lock = threading.Lock()
     counter = 0
     failed = False
@@ -31,6 +36,8 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
 
     def now_ms():
         return (time.monotonic_ns() - origin) // 1_000_000
+
+    prefetch = AudioPrefetch(audio_buffer_bytes, files["audio"].stat().st_size, now_ms)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -57,8 +64,9 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
             start_time = time.monotonic()
             started_ms = now_ms()
             match = re.fullmatch(r"/(?:attempt/([12])/)?(video\.mp4|audio\.m4a)", self.path)
-            kind = ("video" if match[2] == "video.mp4" else "audio") if match else None
-            attempt = (match[1] or "0") if match else "unknown"
+            internal = audio_buffer_bytes > 0 and self.path == "/prefetch/audio.m4a"
+            kind = "audio" if internal else (("video" if match[2] == "video.mp4" else "audio") if match else None)
+            attempt = "prefetch" if internal else ((match[1] or "0") if match else "unknown")
             with lock:
                 counter += 1
                 rid = counter
@@ -69,6 +77,7 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
             status, sent, lo, hi = 404, 0, None, None
             headers_ms = first_byte_ms = None
             outcome = "complete"
+            cache = "origin"
             try:
                 if kind is None:
                     self.send_response(404)
@@ -78,7 +87,17 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
                     return
                 path = files[kind]
                 size = path.stat().st_size
-                if delay_ms:
+                if body and attempt == "0" and kind == "video":
+                    prefetch.start(self.server.server_port)
+                cached = None
+                if body and attempt == "0" and kind == "audio" and audio_buffer_bytes:
+                    cached = prefetch.available(self.server.server_port)
+                    if cached is not None and len(cached) == size:
+                        cache = "audio_hit"
+                    else:
+                        cached = None
+                        cache = "audio_miss"
+                if delay_ms and cached is None:
                     time.sleep(delay_ms / 1000)
                 if inject:
                     status = 503
@@ -106,7 +125,17 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
                 self.end_headers()
                 headers_ms = now_ms()
                 print(f"range-fixture event=headers id={rid} stream={kind} attempt={attempt} t_ms={headers_ms} status={status}", flush=True)
-                if body:
+                if body and cached is not None:
+                    # A view avoids copying the whole retained audio object for a range.
+                    view = memoryview(cached)
+                    for offset in range(lo, hi + 1, 65536):
+                        data = view[offset:min(hi+1, offset+65536)]
+                        self.wfile.write(data)
+                        if first_byte_ms is None:
+                            first_byte_ms = now_ms()
+                            print(f"range-fixture event=first_write id={rid} stream={kind} attempt={attempt} t_ms={first_byte_ms}", flush=True)
+                        sent += len(data)
+                elif body:
                     with path.open("rb") as stream:
                         stream.seek(lo)
                         remaining = hi - lo + 1
@@ -128,7 +157,7 @@ def make_handler(files, delay_ms=0, fail_once=None, fail_always=None):
                       f"status={status} start={lo} end={hi} sent={sent} "
                       f"elapsed_ms={int((time.monotonic()-start_time)*1000)} attempt={attempt} "
                       f"started_ms={started_ms} headers_ms={headers_ms} first_write_ms={first_byte_ms} "
-                      f"ended_ms={now_ms()} outcome={outcome}", flush=True)
+                      f"ended_ms={now_ms()} outcome={outcome} cache={cache}", flush=True)
 
     return Handler
 
@@ -137,17 +166,20 @@ def main():
     p.add_argument("--directory", type=Path, required=True)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--delay-ms", type=int, default=0)
+    p.add_argument("--audio-buffer-bytes", type=int, default=0, help="loopback audio-only prefetch cap, 0 disables; max 4194304")
     fault = p.add_mutually_exclusive_group()
     fault.add_argument("--fail-once", choices=["video", "audio"])
     fault.add_argument("--fail-always", choices=["video", "audio"])
     a = p.parse_args()
     if not 1 <= a.port <= 65535 or not 0 <= a.delay_ms <= 10000:
         p.error("invalid port or delay")
+    if not 0 <= a.audio_buffer_bytes <= 4 * 1024 * 1024 or (a.audio_buffer_bytes and (a.fail_once or a.fail_always)):
+        p.error("invalid audio buffer cap or combined fault injection")
     files = {"video": a.directory / "video.mp4", "audio": a.directory / "audio.m4a"}
     if any(not x.is_file() or x.stat().st_size <= 0 for x in files.values()):
         p.error("nonempty video.mp4 and audio.m4a required")
-    with ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(files, a.delay_ms, a.fail_once, a.fail_always)) as server:
-        print(f"range-fixture ready port={a.port} delay_ms={a.delay_ms} fail_once={a.fail_once} fail_always={a.fail_always}", flush=True)
+    with ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(files, a.delay_ms, a.fail_once, a.fail_always, a.audio_buffer_bytes)) as server:
+        print(f"range-fixture ready port={a.port} delay_ms={a.delay_ms} fail_once={a.fail_once} fail_always={a.fail_always} audio_buffer_bytes={a.audio_buffer_bytes}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

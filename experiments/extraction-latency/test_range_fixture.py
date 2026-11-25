@@ -1,4 +1,6 @@
 import http.client
+import contextlib
+import io
 import tempfile
 import threading
 import unittest
@@ -68,3 +70,44 @@ class RangeFixtureTest(unittest.TestCase):
                     conn.close()
                     server.shutdown()
                     thread.join()
+
+
+    def test_prefetched_audio_serves_exact_ranges_and_video_stays_origin(self):
+        self.check_audio_buffer(16, "audio_hit", "status=ready", True)
+
+    def test_oversized_audio_uses_origin_without_prefetch(self):
+        self.check_audio_buffer(4, "audio_miss", "status=over_budget", False)
+
+    def check_audio_buffer(self, cap, expected_cache, expected_status, expected_fetch):
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()) as log:
+            video = Path(d) / "video.mp4"
+            audio = Path(d) / "audio.m4a"
+            video.write_bytes(b"ABCDEFGHIJ")
+            audio.write_bytes(b"0123456789")
+            with ThreadingHTTPServer(("127.0.0.1", 0), make_handler({"video": video, "audio": audio}, delay_ms=5, audio_buffer_bytes=cap)) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=4)
+                try:
+                    conn.request("GET", "/video.mp4", headers={"Range": "bytes=0-2"})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.read(), b"ABC")
+                    for header, expected in [("bytes=2-4", b"234"), ("bytes=-3", b"789")]:
+                        conn.request("GET", "/audio.m4a", headers={"Range": header})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, 206)
+                        self.assertEqual(response.read(), expected)
+                    conn.request("GET", "/audio.m4a", headers={"Range": "bytes=99-"})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 416)
+                    self.assertEqual(response.read(), b"")
+                finally:
+                    conn.close()
+                    server.shutdown()
+                    thread.join()
+            output = log.getvalue()
+            self.assertIn(expected_status, output)
+            self.assertIn("cache=" + expected_cache, output)
+            self.assertIn("stream=video method=GET status=206", output)
+            self.assertEqual("attempt=prefetch" in output, expected_fetch)
